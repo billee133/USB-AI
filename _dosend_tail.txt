@@ -1,0 +1,42 @@
+985:         if (fullReply) { bubble.innerHTML = (fullThinking ? `<div class="think-block"><div class="think-header" onclick="togBlock(this)"><span class="arrow open">▶</span> 思考过程</div><div class="think-content show">${escapeHtml(fullThinking)}</div></div>`:'') + renderMarkdown(fullReply); }
+986:       } catch(err) { bubble.innerHTML = `❌ ${err.message}`; setStatus('流式失败','error'); closeToolCard(); }
+987:     } else {
+988:       try {
+989:         const resp = await fetch(endpoint, { method:'POST', headers:apiHeaders, body });
+990:         const data = await resp.json();
+991:         if (!resp.ok) { bubble.innerHTML = `❌ API错误: ${data.error?.message||resp.status}`; }
+992:         else {
+993:           const msg = data.choices?.[0]?.message||{};
+994:           fullReply = msg.content||'(无内容)'; fullThinking = msg.reasoning_content||'';
+995:           bubble.innerHTML = renderMarkdown(fullReply);
+996:           setStatus('完成','success');
+997:         }
+998:       } catch(err) { bubble.innerHTML = `❌ ${err.message}`; setStatus('网络错误','error'); }
+999:       closeToolCard();
+1000:     }
+1001:     if (fullReply) { chatHistory.push({role:'assistant',content:fullReply}); autoSaveCurrentChat(); }
+1002:   } catch(err) {
+1003:     setStatus(`网络错误: ${err.message}`,'error');
+1004:     addMessage('assistant',`❌ 请求失败\n\n**${err.message}**`,{searchResults});
+1005:   }
+1006: 
+1007: 
+1008: 
+1009:   // Guaranteed cleanup — every exit path reaches here
+1010:   closeToolCard();
+1011:   clearInterval(window._twInterval);  // safety: kill typewriter interval
+1012:   pendingUploads = []; renderPendingChips();
+1013:   clearTimeout(safetyTimer);
+1014:   isProcessing = false;
+1015:   document.getElementById('send-btn').disabled = false;
+1016:   document.getElementById('user-input').focus();
+1017:   setToggleRunning(false); updateChips();
+1018: 
+1019: function sendMessage() {
+1020:   const input = document.getElementById('user-input');
+1021:   const content = input.value.trim();
+1022:   if (!content) return;
+1023:   input.value = '';
+1024:   doSend(content);
+1025: }
+1026: 

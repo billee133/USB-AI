@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>USB-AI v4</title>
+<link rel="stylesheet" href="style.css?v=13">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css" id="hl-theme">
+</head>
+<body class="light">
+<div id="bar">
+  <button id="menu-btn" onclick="tglSide()">☰</button>
+  <span class="logo">USB-AI v4</span>
+  <button class="c" id="c-think" onclick="tglThink()">🧠 <span class="tt">深度思考</span></button>
+  <button class="c" id="c-search" onclick="tglSearch()">🌐 <span class="tt">联网搜索</span></button>
+  <span class="spacer"></span>
+  <button class="btn" onclick="tglTheme()">☀</button>
+  <button class="btn" onclick="openSet()">⚙</button>
+  <button class="btn" onclick="clrChat()">🗑</button>
+</div>
+<div id="modal" onclick="if(event.target===this)closeSet()">
+  <div id="modal-box">
+    <h3 style="font-size:16px;margin-bottom:14px;color:var(--txe)">⚙ 设置</h3>
+    <input type="password" id="apikey" placeholder="sk-...">
+    <select id="model"><option value="deepseek-v4-pro">V4 Pro</option><option value="deepseek-v4-flash">V4 Flash</option><option value="deepseek-chat">V3</option><option value="deepseek-reasoner">R1</option><option value="deepseek-r1:1.5b">R1 1.5B (本地)</option><option value="qwen2.5:0.5b">Qwen 0.5B (本地)</option></select>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--txt);margin-bottom:10px;cursor:pointer"><input type="checkbox" id="debug-toggle" onchange="toggleDebug()"> 显示调试日志</label>
+    <div class="acts"><button onclick="closeSet()">取消</button><button class="pri" onclick="saveSet()">保存</button></div>
+  </div>
+</div>
+<div id="layout">
+  <div id="side">
+    <div class="head"><span>对话历史</span><button class="btn" onclick="newChat()" style="font-size:10px;padding:3px 6px">＋新建</button></div>
+    <div id="chat-list"></div>
+    <div id="debug-panel" style="display:none;border-top:1px solid var(--bdr);flex-shrink:0;max-height:200px;overflow-y:auto">
+      <div style="font-size:9px;color:var(--txd);padding:4px 10px;background:var(--side)">📋 调试日志</div>
+      <pre id="debug-log" style="font-size:9px;color:var(--txd);padding:4px 10px;margin:0;white-space:pre-wrap;word-break:break-all;background:var(--code)"></pre>
+    </div>
+  </div>
+  <div id="main">
+    <div id="welcome"><div class="w-title">今天需要什么帮助？</div><div class="w-desc">DeepSeek V4 · 联网搜索 · /search 搜网页</div><textarea id="winput" placeholder="输入消息…" rows="1"></textarea><button onclick="sendW()" id="wsend">发送</button></div>
+    <div id="chat"></div>
+    <div id="status"><span id="model-badge"></span><span id="status-text">就绪 · 点 ⚙ 配置 API Key</span></div>
+    <div id="input-wrap"><textarea id="input" placeholder="输入消息…" rows="1"></textarea><button id="send" onclick="send()">发送</button></div>
+  </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script src="conversation-manager.js?v=13"></script>
+<script src="app.js?v=13"></script>
+</body>
+</html>

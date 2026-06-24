@@ -1,0 +1,30 @@
+def _sogou_search(query, num=5):
+    """Sogou.com (搜狗搜索) — best Chinese search results."""
+    results = []
+    try:
+        html = _fetch(f"https://www.sogou.com/web?{urllib.parse.urlencode({'query': query})}",
+                       extra_headers={"Accept": "text/html,application/xhtml+xml"})
+        if len(html) < 5000: return results
+        # Sogou results in <div class="rb"> blocks
+        blocks = re.split(r'<div[^>]*class="[^"]*rb[^"]*"[^>]*>', html)[1:]
+        for block in blocks:
+            if len(results) >= num: break
+            # Title in <h3><a>
+            lm = re.search(r'<h3[^>]*>[\s\S]*?<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>', block, re.I)
+            if not lm: continue
+            url, title_raw = lm.group(1), lm.group(2)
+            title = _clean(title_raw)
+            # Skip sogou internal links
+            if 'sogou.com' in url.lower() and '/link?' not in url.lower(): continue
+            if len(title) < 5: continue
+            # Snippet in <p class="str_info"> or <div class="space-txt">
+            sm = re.search(r'<p[^>]*class="[^"]*str_info[^"]*"[^>]*>([\s\S]*?)</p>', block, re.I)
+            if not sm:
+                sm = re.search(r'<div[^>]*class="[^"]*space-txt[^"]*"[^>]*>([\s\S]*?)</div>', block, re.I)
+            if not sm:
+                sm = re.search(r'<p[^>]*>([\s\S]{10,300}?)</p>', block, re.I)
+            snippet = _clean(sm.group(1))[:500] if sm else ""
+            results.append({"title": title, "url": url, "snippet": snippet, "engine": "Sogou"})
+    except Exception as e:
+        print(f"  [Sogou] {type(e).__name__}", file=sys.stderr)
+    return results
