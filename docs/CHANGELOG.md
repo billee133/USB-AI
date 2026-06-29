@@ -1,5 +1,15 @@
 # USB-AI 变更日志
 
+## v4.5.4（2026-06-29）
+
+### 新增：局域网二维码 + Network API
+- 启动时自动检测 LAN IP，打印二维码 URL（`api.qrserver.com`，无依赖）
+- 新增 `/api/network-info` 端点：返回 `{localhost, lan, lanIp, port}`
+- 提取 `_get_lan_ip()` 工具函数，复用 LAN IP 检测逻辑
+- 移除旧 `socket.gethostbyname()` 调用，统一走 `_get_lan_ip()`
+
+---
+
 ## v4.5.3（2026-06-29）
 
 ### Bug 修复

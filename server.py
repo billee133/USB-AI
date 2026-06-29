@@ -1924,6 +1924,17 @@ def _inject_tool_prompt(body_json):
     body_json["messages"].insert(0, {"role": "system", "content": _TOOL_SYSTEM_PROMPT})
 
 
+def _get_lan_ip():
+    """Detect LAN IP address (no deps)."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
 # ============ AIProxyHandler ============
 
 
@@ -1964,6 +1975,16 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             return
         if self.path == "/api/ping":
             self._send_json({"ok": True, "engines": ["Sogou", "Bing", "DuckDuckGo"], "version": "4.1"})
+            return
+        # Network info for QR code / mobile access
+        if self.path == "/api/network-info":
+            lan_ip = _get_lan_ip()
+            self._send_json({
+                "localhost": f"http://localhost:{PORT}",
+                "lan": f"http://{lan_ip}:{PORT}",
+                "lanIp": lan_ip,
+                "port": PORT
+            })
             return
         # DB API routes
         if self.path.startswith("/api/db/"):
@@ -2864,8 +2885,7 @@ def main():
     from socketserver import ThreadingMixIn
     class ThreadedServer(ThreadingMixIn, http.server.HTTPServer):
         daemon_threads = True  # Threads die on exit
-    import socket
-    local_ip = socket.gethostbyname(socket.gethostname())
+    lan_ip = _get_lan_ip()
     bind_addr = "127.0.0.1" if "--local-only" in sys.argv else "0.0.0.0"
     try:
         server = ThreadedServer((bind_addr, PORT), AIProxyHandler)
@@ -2874,15 +2894,20 @@ def main():
         print(f"  请先关闭其他程序或执行: taskkill /F /IM python.exe")
         return
     if bind_addr == "0.0.0.0":
-        print(f"  [NET] 局域网地址: http://{local_ip}:{PORT}")
+        print(f"  [NET] 局域网地址: http://{lan_ip}:{PORT}")
         print(f"  [SEC] 警告: 同一网络下其他设备可访问")
     else:
         print(f"  [SEC] 仅本地访问 (--local-only)")
+    # QR code for mobile scanning (external API, no deps)
+    import urllib.parse
+    _qr_api = f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={urllib.parse.quote(f'http://{lan_ip}:{PORT}')}"
     print(f"""
 ============================================
   USB-AI - 服务器模式
 ============================================
   本地地址: http://localhost:{PORT}
+  局域网:   http://{lan_ip}:{PORT}
+  手机扫码: {_qr_api}
   API代理:  /api/deepseek -> DeepSeek API
   多引擎搜索: /api/search -> Sogou + Bing + DDG
   数据存储: /api/db/*     -> SQLite
