@@ -1935,7 +1935,7 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         # Serve locally cached vendor assets (offline-first)
         if self.path.startswith("/static/"):
             rel = self.path[len("/static/"):]
-            local = os.path.join(_VENDOR_DIR, rel)
+            local = os.path.join(SCRIPT_DIR, "static", rel)
             if os.path.isfile(local):
                 ext = os.path.splitext(local)[1].lower()
                 ct = {".js": "application/javascript", ".css": "text/css"}.get(ext, "application/octet-stream")

@@ -55,3 +55,5 @@
 | 2026-06-23 22:33:19 | ERROR | search | Bing | <urlopen error [Errno 2] No such file or directory> | 待修复 |
 | 2026-06-28 20:11:32 | ERROR | search | DDG | Non-JSON response: application/x-javascript | 待修复 |
 | 2026-06-28 20:15:57 | ERROR | search | DDG | Non-JSON response: application/x-javascript | 待修复 |
+| 2026-06-29 12:23:25 | ERROR | search | DDG | Non-JSON response: application/x-javascript | 待修复 |
+| 2026-06-29 12:26:08 | ERROR | search | DDG | Non-JSON response: application/x-javascript | 待修复 |
