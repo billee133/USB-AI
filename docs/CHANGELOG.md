@@ -1,5 +1,32 @@
 # USB-AI 变更日志
 
+## v4.5.5（2026-06-29）
+
+### 新增：便携本地模型（llama-cpp-python 集成）
+通过 pip 包实现本地推理，零项目体积增量，可快速装卸。
+
+- `_load_local_model()` / `_unload_local_model()`：动态加载/卸载 GGUF 模型
+- `_auto_load_local()`：请求时自动按 `_local_` 前缀找 `.gguf` → 加载 → 推理
+- `_find_gguf_models()`：扫描 `runtime/models/` 下的 `.gguf` 文件
+- `_local_chat_completion()`：流式 + 非流式双模式推理（`stop` token 控制）
+- GET `/api/local-llm/status`：查询 {loaded, modelPath, models[], hasDependency}
+- POST `/api/local-llm/load`：手动加载指定或首个 GGUF
+- POST `/api/local-llm/unload`：卸载模型释放内存
+- `_check_llama_cpp()`：探测包是否安装，不安装则自动降级到 Ollama/API
+
+### 前端更新
+- 设置下拉框动态填充：`llama-cpp 本地` 分组取自 `/api/local-llm/status` 的 models 列表
+- 前端 API Key 检查跳过 `_local_` 模型（无需 Key）
+
+### 安装/卸载脚本
+- `setup_local_model.bat`：pip install llama-cpp-python + 下载 Qwen2.5-0.5B GGUF
+- `uninstall_local_model.bat`：pip uninstall llama-cpp-python，零残留回退
+
+### 其他
+- `.gitignore` 新增 `*.gguf` 规则
+
+---
+
 ## v4.5.4（2026-06-29）
 
 ### 新增：局域网二维码 + Network API

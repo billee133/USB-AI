@@ -209,7 +209,7 @@ function apiHd(k){return location.protocol=='file:'?{'Content-Type':'application
 // ============ Core Send Flow (optimized) ============
 async function doSend(txt){
   if(busy)return;const mdName=document.getElementById('model').value;const key=document.getElementById('apikey').value.trim();
-  if(!key&&mdName.indexOf(':')===-1){stat('请先设置 API Key','var(--dng)');openSet();return}
+  if(!key&&mdName.indexOf(':')===-1&&mdName.indexOf('_local_')!==0){stat('请先设置 API Key','var(--dng)');openSet();return}
 
   // Step 0: Classify intent
   const route=_classify(txt);_dlog('ROUTE',route);

@@ -327,6 +327,86 @@ def _inject_token(token):
         print(f"  [CSRF] warn: token inject failed: {e}")
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
+# ============ Local LLM (llama-cpp-python, optional) ============
+# pip install llama-cpp-python → local inference with GGUF models
+# pip uninstall llama-cpp-python → clean removal, falls back to Ollama/API
+_LOCAL_LLM = None          # llama_cpp.Llama instance
+_LOCAL_LLM_MODEL = None    # Path to loaded GGUF
+_LOCAL_LLM_LOCK = threading.Lock()
+
+def _find_gguf_models():
+    """List GGUF files in runtime/models/."""
+    d = os.path.join(SCRIPT_DIR, "runtime", "models")
+    if not os.path.isdir(d):
+        return []
+    return sorted([os.path.join(d, f) for f in os.listdir(d) if f.endswith('.gguf')])
+
+def _load_local_model(model_path=None):
+    """Load GGUF via llama-cpp-python. Returns (ok, msg)."""
+    global _LOCAL_LLM, _LOCAL_LLM_MODEL
+    _unload_local_model()
+    if not model_path:
+        cands = _find_gguf_models()
+        if not cands:
+            return False, "runtime/models/ 下没有 .gguf 文件"
+        model_path = cands[0]
+    try:
+        import llama_cpp
+        _LOCAL_LLM = llama_cpp.Llama(
+            model_path=model_path, n_ctx=4096,
+            n_threads=max(2, (os.cpu_count() or 2) - 1),
+            verbose=False
+        )
+        _LOCAL_LLM_MODEL = model_path
+        name = os.path.basename(model_path)
+        print(f"  [LOCAL-LLM] Loaded: {name}")
+        return True, f"已加载 {name}"
+    except ImportError:
+        return False, "llama-cpp-python 未安装。运行: pip install llama-cpp-python"
+    except Exception as e:
+        return False, f"模型加载失败: {str(e)[:200]}"
+
+def _unload_local_model():
+    """Unload model, free memory."""
+    global _LOCAL_LLM, _LOCAL_LLM_MODEL
+    if _LOCAL_LLM is not None:
+        try:
+            del _LOCAL_LLM
+        except Exception:
+            pass
+        _LOCAL_LLM = None
+        _LOCAL_LLM_MODEL = None
+        print("  [LOCAL-LLM] Unloaded")
+
+
+def _resolve_local_model(model_name):
+    """Find GGUF by filename in runtime/models/. Returns (path or None)."""
+    name_only = os.path.basename(model_name.replace('_local_', '', 1))
+    cands = _find_gguf_models()
+    for p in cands:
+        if os.path.basename(p) == name_only:
+            return p
+    # Fallback: first available
+    return cands[0] if cands else None
+
+def _auto_load_local(model_name):
+    """Auto-load model if not already loaded. Returns (ok, msg)."""
+    if _LOCAL_LLM is not None:
+        return True, "already loaded"
+    p = _resolve_local_model(model_name)
+    if not p:
+        return False, "no .gguf found in runtime/models/"
+    return _load_local_model(p)
+
+def _check_llama_cpp():
+    """Check if llama-cpp-python is importable."""
+    try:
+        import llama_cpp
+        return True
+    except ImportError:
+        return False
+
+
 def _fetch(url, timeout=12, extra_headers=None):
     h = {"User-Agent": _UA, "Accept-Language": "zh-CN,zh;q=0.9"}
     if extra_headers: h.update(extra_headers)
@@ -1986,6 +2066,15 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                 "port": PORT
             })
             return
+        # Local LLM status
+        if self.path == "/api/local-llm/status":
+            self._send_json({
+                "loaded": _LOCAL_LLM is not None,
+                "modelPath": _LOCAL_LLM_MODEL,
+                "models": _find_gguf_models(),
+                "hasDependency": _check_llama_cpp(),
+            })
+            return
         # DB API routes
         if self.path.startswith("/api/db/"):
             self._handle_db_get()
@@ -2044,7 +2133,11 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._handle_tool()
         elif self.path == "/api/classify":
             self._handle_classify()
-
+        elif self.path == "/api/local-llm/load":
+            self._handle_local_load()
+        elif self.path == "/api/local-llm/unload":
+            _unload_local_model()
+            self._send_json({"ok": True})
         elif self.path.startswith("/api/db/"):
             self._handle_db_post()
         else:
@@ -2052,10 +2145,85 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
 
     def _get_llm_url(self, model):
         """Return (url, needs_auth) for the given model.
-        Cloud models use DeepSeek API. Local models (with ':' tag) use Ollama."""
-        if ':' in model:  # Ollama model tag format, e.g. deepseek-r1:1.5b
+        Cloud models use DeepSeek API. Local models (with ':' tag) use Ollama.
+        '_local_' prefix models use llama-cpp-python (handled separately)."""
+        if model.startswith('_local_'):
+            return None, False  # Handled by _handle_local_{stream,sync}
+        if ':' in model:  # Ollama model tag format
             return "http://localhost:11434/v1/chat/completions", False
         return "https://api.deepseek.com/v1/chat/completions", True
+
+    def _local_chat_completion(self, messages, stream=False, max_tokens=4096):
+        """Call local llama-cpp-python model. Returns (ok, result)."""
+        with _LOCAL_LLM_LOCK:
+            if _LOCAL_LLM is None:
+                return False, {"error": "本地模型未加载"}
+            prompt = ""
+            for m in messages:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                if role == "system":
+                    prompt += f"<|system|>\n{content}\n"
+                elif role == "user":
+                    prompt += f"<|user|>\n{content}\n"
+                elif role == "assistant":
+                    prompt += f"<|assistant|>\n{content}\n"
+            prompt += "<|assistant|>\n"
+            try:
+                if stream:
+                    return True, _LOCAL_LLM.create_completion(
+                        prompt, max_tokens=max_tokens, stream=True,
+                        temperature=0.7, stop=["<|user|>", "<|system|>"])
+                result = _LOCAL_LLM.create_completion(
+                    prompt, max_tokens=max_tokens, stream=False,
+                    temperature=0.7, stop=["<|user|>", "<|system|>"])
+                text = result.get("choices", [{}])[0].get("text", "")
+                return True, {"choices": [{"message": {"content": text}}]}
+            except Exception as e:
+                return False, {"error": str(e)[:300]}
+
+    def _handle_local_stream(self, body_json):
+        """SSE streaming from local model."""
+        messages = body_json.get("messages", [])
+        ok, gen = self._local_chat_completion(messages, stream=True)
+        if not ok:
+            self.wfile.write(f'data: {json.dumps(gen)}\n\n'.encode())
+            self.wfile.write(b'data: [DONE]\n\n')
+            self.wfile.flush()
+            return ""
+        import random
+        full_text = ""
+        for chunk in gen:
+            delta = chunk.get("choices", [{}])[0].get("text", "")
+            if not delta:
+                continue
+            full_text += delta
+            sid = f"chatcmpl-{random.randint(100000,999999)}"
+            data = json.dumps({
+                "id": sid, "object": "chat.completion.chunk",
+                "choices": [{"delta": {"content": delta}, "index": 0}]})
+            self.wfile.write(f'data: {data}\n\n'.encode())
+            self.wfile.flush()
+        self.wfile.write(b'data: [DONE]\n\n')
+        self.wfile.flush()
+        return full_text
+
+    def _handle_local_sync(self, body_json):
+        """Non-streaming response from local model."""
+        ok, result = self._local_chat_completion(
+            body_json.get("messages", []), stream=False)
+        return result if ok else result  # Result dict on both paths
+
+    def _handle_local_load(self):
+        """POST /api/local-llm/load — load a GGUF model."""
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_length)) if content_length else {}
+            model_path = body.get("modelPath", None)
+            ok, msg = _load_local_model(model_path)
+            self._send_json({"ok": ok, "message": msg})
+        except Exception as e:
+            self._send_json({"ok": False, "message": str(e)[:200]})
 
     def _handle_deepseek_stream(self):
         """Streaming SSE proxy with P3 TOOL protocol support."""
@@ -2066,6 +2234,26 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         body_json = json.loads(body)
         body_json["stream"] = True
         model = body_json.get("model", "")
+        # Route to local model if model name starts with _local_
+        if model.startswith('_local_'):
+            ok, msg = _auto_load_local(model)
+            if not ok:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", f"http://localhost:{PORT}"))
+                self.end_headers()
+                self.wfile.write(f'data: {{"error":"{msg}"}}\n\n'.encode())
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", f"http://localhost:{PORT}"))
+            self.end_headers()
+            self._handle_local_stream(body_json)
+            return
         api_url, needs_auth = self._get_llm_url(model)
 
         # Inject P3 TOOL system prompt into system message
@@ -2161,8 +2349,20 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             api_key = self.headers.get("X-API-Key", "")
             body_json = json.loads(body)
             model = body_json.get("model", "")
-            api_url, needs_auth = self._get_llm_url(model)
             body_json["stream"] = False
+            # Route to local model if model name starts with _local_
+            if model.startswith('_local_'):
+                ok, msg = _auto_load_local(model)
+                if not ok:
+                    self._send_json({"error": msg}, status=500)
+                    return
+                result = self._handle_local_sync(body_json)
+                if "error" in result:
+                    self._send_json(result, status=500)
+                else:
+                    self._send_json(result)
+                return
+            api_url, needs_auth = self._get_llm_url(model)
 
             # Inject P3 TOOL system prompt
             _inject_tool_prompt(body_json)

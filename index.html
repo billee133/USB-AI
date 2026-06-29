@@ -25,7 +25,17 @@
   <div id="modal-box">
     <h3 style="font-size:16px;margin-bottom:14px;color:var(--txe)">⚙ 设置</h3>
     <input type="password" id="apikey" placeholder="sk-...">
-    <select id="model"><option value="deepseek-v4-pro">V4 Pro</option><option value="deepseek-v4-flash">V4 Flash</option><option value="deepseek-chat">V3</option><option value="deepseek-reasoner">R1</option><option value="deepseek-r1:1.5b">R1 1.5B (本地)</option><option value="qwen2.5:0.5b">Qwen 0.5B (本地)</option></select>
+    <select id="model">
+      <option value="deepseek-v4-pro">V4 Pro</option>
+      <option value="deepseek-v4-flash">V4 Flash</option>
+      <option value="deepseek-chat">V3</option>
+      <option value="deepseek-reasoner">R1</option>
+      <optgroup label="Ollama 本地">
+        <option value="deepseek-r1:1.5b">R1 1.5B</option>
+        <option value="qwen2.5:0.5b">Qwen 0.5B</option>
+      </optgroup>
+      <optgroup id="local-llm-group" label="llama-cpp 本地"></optgroup>
+    </select>
     <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--txt);margin-bottom:10px;cursor:pointer"><input type="checkbox" id="debug-toggle" onchange="toggleDebug()"> 显示调试日志</label>
     <div class="acts"><button onclick="closeSet()">取消</button><button class="pri" onclick="saveSet()">保存</button></div>
   </div>
@@ -50,6 +60,8 @@
 <script src="app.js?v=14"></script>
 <script>
 (function(){['marked.min.js','katex.min.js','highlight.min.js'].forEach(function(n){var l='/static/vendor/'+n,cdns={'marked.min.js':'https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js','katex.min.js':'https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js','highlight.min.js':'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js'};var s=document.createElement('script');s.src=l;s.onerror=function(){var f=document.createElement('script');f.src=cdns[n];document.body.appendChild(f)};document.body.appendChild(s)})})();
+// Populate local LLM models from server
+if(location.protocol!=='file:'){fetch('/api/local-llm/status').then(function(r){return r.json()}).then(function(d){var g=document.getElementById('local-llm-group');if(!g||!d.models||!d.models.length)return;d.models.forEach(function(p){var o=document.createElement('option');var n=p.split('/').pop().split('\\').pop();o.value='_local_'+n;o.textContent=n;if(d.loaded&&d.modelPath===p)o.selected=true;g.appendChild(o)})}).catch(function(){})}
 </script>
 </body>
 </html>
