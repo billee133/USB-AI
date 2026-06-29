@@ -312,7 +312,7 @@ class Database:
 # Global DB instance + CSRF token
 import secrets
 db = None
-LOCAL_TOKEN = secrets.token_hex(16)  # One-time token for local API auth
+LOCAL_TOKEN = None  # Loaded/generated on startup, persisted across restarts
 
 def _inject_token(token):
     """Replace placeholder (empty or old) with actual token."""
@@ -2531,7 +2531,11 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                     cmd = [sys.executable, "-m", "pip", "install"] + whls + ["--quiet"]
                 else:
                     cmd = [sys.executable, "-m", "pip", "install", "pyautogui", "pillow", "--quiet"]
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                # Strip proxy vars (Windows system proxy can break pip)
+                pip_env = {k: v for k, v in os.environ.items()
+                           if k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")}
+                pip_env["no_proxy"] = "*"
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=pip_env)
                 self._send_json({"ok": r.returncode == 0,
                                  "message": "安装成功" if r.returncode == 0 else r.stderr[:200],
                                  "source": "local" if whls else "online"})
@@ -3393,14 +3397,26 @@ Current Date: {_now.strftime('%Y-%m-%d')}
 
 
 def main():
-    global db
+    global db, LOCAL_TOKEN
     # Switch to script directory
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     # Initialize database
     db = Database(DB_PATH)
     print(f"  [DB] SQLite initialized: {DB_PATH}")
-    # Inject LOCAL_TOKEN into index.html for CSRF protection
+    # Load or persist LOCAL_TOKEN (data/local_token.txt)
+    import secrets
+    token_path = os.path.join(SCRIPT_DIR, "data", "local_token.txt")
+    try:
+        with open(token_path) as f:
+            LOCAL_TOKEN = f.read().strip()
+    except (FileNotFoundError, IOError):
+        LOCAL_TOKEN = secrets.token_hex(16)
+        try:
+            with open(token_path, "w") as f:
+                f.write(LOCAL_TOKEN)
+        except Exception:
+            pass
     _inject_token(LOCAL_TOKEN)
     print(f"  [CSRF] token injected: {LOCAL_TOKEN[:8]}...")
     # Pre-cache vendor assets for offline use
