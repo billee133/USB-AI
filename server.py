@@ -2338,6 +2338,8 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._handle_auto_settings()
         elif self.path == "/api/auto/task":
             self._handle_auto_task()
+        elif self.path == "/api/auto/install":
+            self._handle_auto_install()
         elif self.path.startswith("/api/db/"):
             self._handle_db_post()
         else:
@@ -2513,6 +2515,36 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._send_json(tool_task_list())
         else:
             self._send_json({"ok": False, "error": "action 须为 create/stop/list"})
+
+    def _handle_auto_install(self):
+        """POST /api/auto/install — install or uninstall pyautogui + pillow."""
+        if not self._require_auto_token(): return
+        body = self._read_body()
+        action = body.get("action", "")  # "install" | "uninstall"
+        if action == "install":
+            try:
+                import subprocess
+                r = subprocess.run([sys.executable, "-m", "pip", "install", "pyautogui", "pillow", "--quiet"],
+                                   capture_output=True, text=True, timeout=120)
+                if r.returncode == 0:
+                    self._send_json({"ok": True, "message": "安装成功"})
+                else:
+                    self._send_json({"ok": False, "error": r.stderr[:200]})
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)[:200]})
+        elif action == "uninstall":
+            try:
+                import subprocess
+                r = subprocess.run([sys.executable, "-m", "pip", "uninstall", "pyautogui", "pillow", "-y"],
+                                   capture_output=True, text=True, timeout=60)
+                if r.returncode == 0:
+                    self._send_json({"ok": True, "message": "已卸载"})
+                else:
+                    self._send_json({"ok": False, "error": r.stderr[:200]})
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)[:200]})
+        else:
+            self._send_json({"ok": False, "error": "action 须为 install/uninstall"})
 
     def _handle_deepseek_stream(self):
         """Streaming SSE proxy with P3 TOOL protocol support."""
