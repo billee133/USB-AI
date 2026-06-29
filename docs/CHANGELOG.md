@@ -1,5 +1,53 @@
 # USB-AI 变更日志
 
+## v4.5.3（2026-06-29）
+
+### Bug 修复
+- `/static/` 路径双拼错误：`os.path.join(_VENDOR_DIR, rel)` 产生 `vendor/vendor/` 前缀 → 修复为 `os.path.join(SCRIPT_DIR, "static", rel)`
+- 经验证：所有 6 个 vendor 静态文件均从本地正确服务，CDN fallback 正常
+
+---
+
+## v4.5.2（2026-06-29）
+
+### 新增：三引擎健康追踪（Engine Health Tracker）
+- 统一 `_ENGINE_FAILS` 字典追踪 DDG/Bing/Sogou 失败计数
+- 连续失败 3 次后自动禁用引擎，所有引擎禁用时自动重置
+- 替换旧 DDG-only 熔断器（`_DDG_FAILURES`）
+
+### 新增：考试搜索优化
+- $search_edu()$：Sogou `site:` 针对 10 个中国教育域名（edu.cn/neea.edu.cn 等）
+- 零结果三级回退链：news search → broaden（去年份/地区）→ raw query
+- 铁律 3：已结束的考试是公开信息，AI 不得拒绝回答
+
+### 新增：静态资源离线（Static Vendor Assets）
+- 6 个 CDN 资源首次启动时缓存到 `static/vendor/`
+- 本地优先 + CDN fallback（CSS/JS 双模式）
+- `/static/` 路由在 `do_GET` 中优先服务 vendor 文件
+
+### 分类扩展
+- exam 关键词（中考/真题/试题/作文/分数线）+ 6 大类（体育/汽车/电器/电脑/军事/科技）
+- 前后端 REALTIME_RE 同步
+
+---
+
+## v4.5.1（2026-06-29）
+
+### 新增：P3 TOOL 协议
+- SSE 流拦截 `[TOOL:name args]` 指令，自动执行工具，续推理
+- 非流式模式同样支持 TOOL 协议（5 轮循环上限）
+- System Prompt 自动注入：10 个工具的描述和调用格式
+- `<tool_result>` XML 格式封装工具结果供 AI 消费
+- 前端 `_cleanToolMarkers()` 过滤显示中的 `[TOOL:]` 原始标记
+- 抑制上游 `[DONE]`，仅在全部工具轮次结束后发送最终 `[DONE]`
+- 支持文件工具（read/write/ls/mkdir/mv/rm/append/stat）和 Shell 工具（run_command）
+- 日志按 `p3_tool` 类别记录到 `data/tool_log.jsonl`
+
+### 编码修复
+- `server.py` 添加 `# -*- coding: utf-8 -*-`（Chinese in TOOL prompt）
+
+---
+
 ## v4.5（2026-06-29）
 
 ### 新增：AI 自适应数据提取
