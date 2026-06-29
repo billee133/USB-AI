@@ -1,5 +1,33 @@
 # USB-AI 变更日志
 
+## v4.5.6（2026-06-29）
+
+### 新增：桌面自动化代理（pyautogui）
+pip install pyautogui pillow 即可启用，卸载 pip uninstall 零残留。
+
+- `tool_screenshot()`：截屏 → base64 PNG（1280px 自动缩放）
+- `tool_mouse_click()`：鼠标点击，屏幕边界安全校验
+- `tool_type_text()`：键盘输入，非 ASCII 自动切剪贴板粘贴
+- `tool_hotkey()`：快捷键（拦截 Ctrl+Alt+Del / Win+R）
+- `tool_browser_open()`：默认浏览器打开指定 URL（页面测试用）
+- `tool_task_create/stop/list()`：定时任务管理器（最小间隔 5 秒）
+
+### API 端点（均需 X-Local-Token）
+- `POST /api/auto/screenshot` — 截屏
+- `POST /api/auto/click` — 鼠标点击
+- `POST /api/auto/type` — 键盘输入
+- `POST /api/auto/hotkey` — 快捷键
+- `POST /api/auto/browser` — 浏览器打开 URL
+- `POST /api/auto/settings` — 启用/禁用/查询状态
+- `POST /api/auto/task` — 创建/停止/列出定时任务（action=create/stop/list）
+
+### P3 TOOL 协议扩展
+- `_TOOL_SYSTEM_PROMPT` 新增 8 个自动化工具描述
+- `_execute_tool_from_str()` 新增 7 个自动化工具路由
+- 全部走 token 认证 + 日志记录
+
+---
+
 ## v4.5.5（2026-06-29）
 
 ### 新增：便携本地模型（llama-cpp-python 集成）

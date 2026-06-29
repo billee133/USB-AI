@@ -1723,7 +1723,7 @@ _TOOL_NAME_MAP = {
     "run_shell": ("shell", None),
 }
 
-_TOOL_SYSTEM_PROMPT = """\n\n## 本地工具调用\n\n你可以使用以下工具操作本地电脑。工具会在你输出调用指令后自动执行，结果会注入对话。\n\n<tool name="read_file" args="path">读取文件内容。path 必须在 workspace/data/uploads 目录内。</tool>\n<tool name="write_file" args="path, content">写入文件，覆盖已存在文件。</tool>\n<tool name="append_file" args="path, content">追加内容到文件末尾。</tool>\n<tool name="list_directory" args="path">列出目录内容。</tool>\n<tool name="create_directory" args="path">创建新目录。</tool>\n<tool name="move_file" args="src, dst">移动或重命名文件。</tool>\n<tool name="delete_file" args="path">删除文件。</tool>\n<tool name="file_info" args="path">获取文件信息（大小、修改时间）。</tool>\n<tool name="run_command" args="command">在沙箱中执行 Shell 命令。仅白名单命令可用（python/pip/git/npm/node/ls/cat/find/grep/wc/echo/which/pwd/head/tail）。</tool>\n\n调用格式：\n[TOOL:read_file path="data/example.txt"]\n[TOOL:run_command command="ls workspace/"]\n\n工具结果会自动注入，继续推理。一次只调用一个工具，等待结果后决定下一步。"""
+_TOOL_SYSTEM_PROMPT = """\n\n## 本地工具调用\n\n你可以使用以下工具操作本地电脑。工具会在你输出调用指令后自动执行，结果会注入对话。\n\n<tool name="read_file" args="path">读取文件内容。path 必须在 workspace/data/uploads 目录内。</tool>\n<tool name="write_file" args="path, content">写入文件，覆盖已存在文件。</tool>\n<tool name="append_file" args="path, content">追加内容到文件末尾。</tool>\n<tool name="list_directory" args="path">列出目录内容。</tool>\n<tool name="create_directory" args="path">创建新目录。</tool>\n<tool name="move_file" args="src, dst">移动或重命名文件。</tool>\n<tool name="delete_file" args="path">删除文件。</tool>\n<tool name="file_info" args="path">获取文件信息（大小、修改时间）。</tool>\n<tool name="run_command" args="command">在沙箱中执行 Shell 命令。仅白名单命令可用（python/pip/git/npm/node/ls/cat/find/grep/wc/echo/which/pwd/head/tail）。</tool>\n<tool name="screenshot" args="{}">截取屏幕截图，返回 base64 PNG。</tool>\n<tool name="click" args="x, y, button, clicks">模拟鼠标点击。button: left/right/middle。需要用户确认。</tool>\n<tool name="type_text" args="text, interval">在当前光标位置输入文本。非 ASCII 文本用剪贴板粘贴。需要用户确认。</tool>\n<tool name="hotkey" args="keys">发送键盘快捷键（如 ctrl+c）。blocked: Ctrl+Alt+Del/Win+R。需要用户确认。</tool>\n<tool name="browser_open" args="url, newTab">在默认浏览器中打开指定 URL（用于页面测试）。</tool>\n<tool name="task_create" args="interval, taskAction, label">创建定时任务：interval=秒, taskAction=screenshot/ping。最小间隔 5 秒。</tool>\n<tool name="task_stop" args="taskId">停止并删除指定定时任务。</tool>\n\n调用格式：\n[TOOL:read_file path="data/example.txt"]\n[TOOL:run_command command="ls workspace/"]\n[TOOL:screenshot {}]\n[TOOL:click x="100" y="200" button="left"]\n[TOOL:type_text text="你好世界"]\n[TOOL:hotkey keys="ctrl+s"]\n[TOOL:browser_open url="http://localhost:8082"]\n[TOOL:task_create interval="60" taskAction="screenshot"]\n\n工具结果会自动注入，继续推理。一次只调用一个工具，等待结果后决定下一步。"""
 
 
 def _log_tool_action(action, ok=True, duration=0, tool="file"):
@@ -1961,18 +1961,45 @@ def _parse_tool_args(args_str):
 def _execute_tool_from_str(tool_name, args_str, api_key=None):
     """Parse [TOOL:name args] and execute via local tool system."""
     mapping = _TOOL_NAME_MAP.get(tool_name)
-    if not mapping:
-        return {"ok": False, "error": f"Unknown tool: {tool_name}"}
-    action_type, tool_method = mapping
+    if mapping:
+        action_type, tool_method = mapping
+        args = _parse_tool_args(args_str)
+        if action_type == "file":
+            result = _run_file_tool(tool_method, args)
+        elif action_type == "shell":
+            cmd = args.get("command", "")
+            timeout = int(args.get("timeout", "30"))
+            result = _run_shell_cmd(cmd, timeout)
+        else:
+            result = {"ok": False, "error": f"Unknown tool type: {action_type}"}
+        _log_tool_action(f"P3 TOOL: {tool_name}", ok=result.get("ok", False), tool="p3_tool")
+        return result
+
+    # Desktop automation tools (routed via tool args directly)
     args = _parse_tool_args(args_str)
-    if action_type == "file":
-        result = _run_file_tool(tool_method, args)
-    elif action_type == "shell":
-        cmd = args.get("command", "")
-        timeout = int(args.get("timeout", "30"))
-        result = _run_shell_cmd(cmd, timeout)
+    if tool_name == "screenshot":
+        result = tool_screenshot(region=args.get("region"))
+    elif tool_name == "click":
+        result = tool_mouse_click(int(args.get("x", 0)), int(args.get("y", 0)),
+                                  button=args.get("button", "left"),
+                                  clicks=int(args.get("clicks", "1")))
+    elif tool_name == "type_text":
+        result = tool_type_text(args.get("text", ""),
+                                interval=float(args.get("interval", "0.05")))
+    elif tool_name == "hotkey":
+        keys = args.get("keys", "")
+        result = tool_hotkey(*[k.strip() for k in keys.split("+") if k.strip()])
+    elif tool_name == "browser_open":
+        result = tool_browser_open(args.get("url", ""),
+                                   new_tab=args.get("newTab", "true").lower() == "true")
+    elif tool_name == "task_create":
+        result = tool_task_create(int(args.get("interval", "60")),
+                                  args.get("taskAction", "ping"),
+                                  args.get("label", ""))
+    elif tool_name == "task_stop":
+        result = tool_task_stop(args.get("taskId", ""))
     else:
-        result = {"ok": False, "error": f"Unknown tool type: {action_type}"}
+        return {"ok": False, "error": f"Unknown tool: {tool_name}"}
     _log_tool_action(f"P3 TOOL: {tool_name}", ok=result.get("ok", False), tool="p3_tool")
     return result
 
@@ -2013,6 +2040,161 @@ def _get_lan_ip():
             return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"
+
+
+# ============ Desktop Automation (pyautogui, optional) ============
+_AUTO_ENABLED = False
+
+def _check_auto_deps():
+    """Check if pyautogui + PIL are installed."""
+    d = {}
+    try: import pyautogui; d['pyautogui'] = True
+    except ImportError: d['pyautogui'] = False
+    try: from PIL import Image; d['pillow'] = True
+    except ImportError: d['pillow'] = False
+    return d
+
+def tool_screenshot(region=None):
+    """Screenshot → base64 PNG. Optional region=(x,y,w,h)."""
+    if not _AUTO_ENABLED:
+        return {"ok": False, "error": "桌面自动化未启用"}
+    try:
+        import pyautogui
+        from PIL import Image
+        import io, base64
+        img = pyautogui.screenshot(region=region)
+        w, h = img.size
+        if w > 1280:
+            img = img.resize((1280, int(h * 1280 / w)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        _log_tool_action("screenshot", {"size": img.size}, ok=True)
+        return {"ok": True, "image_b64": base64.b64encode(buf.getvalue()).decode(),
+                "size": list(img.size), "format": "png"}
+    except ImportError:
+        return {"ok": False, "error": "pip install pyautogui pillow"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+def tool_mouse_click(x, y, button="left", clicks=1):
+    """Click at screen coordinates. Safety: bounds-checked."""
+    if not _AUTO_ENABLED:
+        return {"ok": False, "error": "桌面自动化未启用"}
+    try:
+        import pyautogui as pg
+        sw, sh = pg.size()
+        if not (0 <= x <= sw and 0 <= y <= sh):
+            return {"ok": False, "error": f"坐标超出 {sw}x{sh}"}
+        pg.click(x=x, y=y, button=button, clicks=clicks, interval=0.15)
+        _log_tool_action("click", {"x": x, "y": y}, ok=True)
+        return {"ok": True, "x": x, "y": y, "button": button}
+    except ImportError:
+        return {"ok": False, "error": "pip install pyautogui pillow"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+def tool_type_text(text, interval=0.05):
+    """Type text at cursor. Non-ASCII: clipboard paste."""
+    if not _AUTO_ENABLED:
+        return {"ok": False, "error": "桌面自动化未启用"}
+    if len(text) > 5000:
+        return {"ok": False, "error": "文本过长（≤5000）"}
+    try:
+        import pyautogui as pg
+        if text.isascii():
+            pg.typewrite(text, interval=interval)
+        else:
+            import subprocess
+            subprocess.run(["clip"], input=text.encode("utf-16-le") + b"\x00\x00", check=True)
+            pg.hotkey("ctrl", "v")
+        _log_tool_action("type_text", {"chars": len(text)}, ok=True)
+        return {"ok": True, "chars": len(text)}
+    except ImportError:
+        return {"ok": False, "error": "pip install pyautogui pillow"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+def tool_hotkey(*keys):
+    """Keyboard shortcut. Blocks Ctrl+Alt+Del / Win+R."""
+    if not _AUTO_ENABLED:
+        return {"ok": False, "error": "桌面自动化未启用"}
+    blocked = {frozenset(k.lower() for k in c)
+               for c in [["ctrl","alt","delete"], ["ctrl","alt","del"],
+                         ["win","r"], ["meta","r"]]}
+    if frozenset(k.lower() for k in keys) in blocked:
+        return {"ok": False, "error": f"快捷键 {'+'.join(keys)} 被安全策略阻止"}
+    try:
+        import pyautogui as pg
+        pg.hotkey(*keys)
+        _log_tool_action("hotkey", {"keys": list(keys)}, ok=True)
+        return {"ok": True, "keys": list(keys)}
+    except ImportError:
+        return {"ok": False, "error": "pip install pyautogui pillow"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+def tool_browser_open(url, new_tab=True):
+    """Open URL in default browser. For page testing."""
+    try:
+        import webbrowser
+        webbrowser.open(url, new=1 if new_tab else 0)
+        _log_tool_action("browser_open", {"url": url}, ok=True)
+        return {"ok": True, "url": url}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+# Scheduled tasks (simple interval-based timer)
+_AUTO_TASKS = {}  # id -> {"interval": seconds, "action": func, "timer": threading.Timer, "running": bool}
+_AUTO_TASK_COUNTER = 0
+
+def _auto_task_runner(task_id, action, interval):
+    """Timer callback: execute action then reschedule."""
+    global _AUTO_TASKS
+    if task_id not in _AUTO_TASKS or not _AUTO_TASKS[task_id]["running"]:
+        return
+    if action == "screenshot":
+        tool_screenshot()
+    elif action == "ping":
+        pass  # Health keepalive
+    # Reschedule
+    t = threading.Timer(interval, _auto_task_runner, args=(task_id, action, interval))
+    t.daemon = True
+    _AUTO_TASKS[task_id]["timer"] = t
+    t.start()
+
+def tool_task_create(interval, action, label=""):
+    """Create a repeating scheduled task."""
+    global _AUTO_TASKS, _AUTO_TASK_COUNTER
+    _AUTO_TASK_COUNTER += 1
+    tid = f"auto_task_{_AUTO_TASK_COUNTER}"
+    t = threading.Timer(interval, _auto_task_runner, args=(tid, action, interval))
+    t.daemon = True
+    _AUTO_TASKS[tid] = {"interval": interval, "action": action, "timer": t,
+                         "running": True, "label": label}
+    t.start()
+    _log_tool_action("task_create", {"id": tid, "action": action}, ok=True)
+    return {"ok": True, "taskId": tid}
+
+def tool_task_stop(task_id):
+    """Stop a scheduled task."""
+    global _AUTO_TASKS
+    t = _AUTO_TASKS.pop(task_id, None)
+    if t:
+        t["running"] = False
+        try: t["timer"].cancel()
+        except: pass
+        _log_tool_action("task_stop", {"id": task_id}, ok=True)
+        return {"ok": True}
+    return {"ok": False, "error": f"任务 {task_id} 不存在"}
+
+def tool_task_list():
+    """List all active scheduled tasks."""
+    global _AUTO_TASKS
+    return {"ok": True, "tasks": [
+        {"id": k, "action": v["action"], "interval": v["interval"],
+         "label": v["label"], "running": v["running"]}
+        for k, v in sorted(_AUTO_TASKS.items()) if v["running"]
+    ]}
 
 
 # ============ AIProxyHandler ============
@@ -2138,6 +2320,21 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         elif self.path == "/api/local-llm/unload":
             _unload_local_model()
             self._send_json({"ok": True})
+        # Desktop automation
+        elif self.path == "/api/auto/screenshot":
+            self._handle_auto_screenshot()
+        elif self.path == "/api/auto/click":
+            self._handle_auto_click()
+        elif self.path == "/api/auto/type":
+            self._handle_auto_type()
+        elif self.path == "/api/auto/hotkey":
+            self._handle_auto_hotkey()
+        elif self.path == "/api/auto/browser":
+            self._handle_auto_browser()
+        elif self.path == "/api/auto/settings":
+            self._handle_auto_settings()
+        elif self.path == "/api/auto/task":
+            self._handle_auto_task()
         elif self.path.startswith("/api/db/"):
             self._handle_db_post()
         else:
@@ -2224,6 +2421,89 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._send_json({"ok": ok, "message": msg})
         except Exception as e:
             self._send_json({"ok": False, "message": str(e)[:200]})
+
+    # ============ Desktop Automation Handlers ============
+
+    def _require_auto_token(self):
+        if not self._check_local_token():
+            self._send_json({"error": "Forbidden"}, status=403)
+            return False
+        return True
+
+    def _handle_auto_screenshot(self):
+        if not self._require_auto_token(): return
+        body = self._read_body()
+        result = tool_screenshot(region=body.get("region"))
+        self._send_json(result)
+
+    def _handle_auto_click(self):
+        if not self._require_auto_token(): return
+        body = self._read_body()
+        result = tool_mouse_click(int(body.get("x", 0)), int(body.get("y", 0)),
+                                  button=body.get("button", "left"),
+                                  clicks=body.get("clicks", 1))
+        self._send_json(result)
+
+    def _handle_auto_type(self):
+        if not self._require_auto_token(): return
+        body = self._read_body()
+        result = tool_type_text(body.get("text", ""),
+                                interval=body.get("interval", 0.05))
+        self._send_json(result)
+
+    def _handle_auto_hotkey(self):
+        if not self._require_auto_token(): return
+        body = self._read_body()
+        keys = body.get("keys", [])
+        if isinstance(keys, str): keys = keys.split("+")
+        result = tool_hotkey(*keys)
+        self._send_json(result)
+
+    def _handle_auto_browser(self):
+        """Open a URL in the default browser for page testing."""
+        if not self._require_auto_token(): return
+        body = self._read_body()
+        url = body.get("url", "")
+        if not url:
+            self._send_json({"error": "缺少 url 参数"}, status=400)
+            return
+        result = tool_browser_open(url, new_tab=body.get("newTab", True))
+        self._send_json(result)
+
+    def _handle_auto_settings(self):
+        """Enable/disable or query desktop automation status."""
+        global _AUTO_ENABLED
+        if not self._require_auto_token(): return
+        body = self._read_body()
+        if "enabled" in body:
+            _AUTO_ENABLED = bool(body["enabled"])
+            print(f"  [AUTO] {'ENABLED' if _AUTO_ENABLED else 'DISABLED'}")
+        deps = _check_auto_deps()
+        self._send_json({"ok": True, "enabled": _AUTO_ENABLED,
+                          "deps": deps,
+                          "missingDeps": [k for k, v in deps.items() if not v]})
+
+    def _handle_auto_task(self):
+        """Create/list/stop scheduled tasks."""
+        if not self._require_auto_token(): return
+        body = self._read_body()
+        action = body.get("action", "")  # create | stop | list
+        if action == "create":
+            interval = int(body.get("interval", 60))
+            task_action = body.get("taskAction", "ping")
+            label = body.get("label", "")
+            if interval < 5:
+                self._send_json({"ok": False, "error": "间隔不可小于 5 秒"})
+                return
+            result = tool_task_create(interval, task_action, label)
+            self._send_json(result)
+        elif action == "stop":
+            result = tool_task_stop(body.get("taskId", ""))
+            self._send_json(result)
+        elif action == "list":
+            self._send_json(tool_task_list())
+        else:
+            self._send_json({"ok": False, "error": "action 须为 create/stop/list"})
 
     def _handle_deepseek_stream(self):
         """Streaming SSE proxy with P3 TOOL protocol support."""
