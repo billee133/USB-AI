@@ -63,5 +63,6 @@
 // Populate local LLM models from server
 if(location.protocol!=='file:'){fetch('/api/local-llm/status').then(function(r){return r.json()}).then(function(d){var g=document.getElementById('local-llm-group');if(!g||!d.models||!d.models.length)return;d.models.forEach(function(p){var o=document.createElement('option');var n=p.split('/').pop().split('\\').pop();o.value='_local_'+n;o.textContent=n;if(d.loaded&&d.modelPath===p)o.selected=true;g.appendChild(o)})}).catch(function(){})}
 </script>
+<script>let LOCAL_TOKEN = '373f1c705ace33161568a5b8450ae9cb';</script>
 </body>
 </html>

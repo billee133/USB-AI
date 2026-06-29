@@ -315,16 +315,19 @@ db = None
 LOCAL_TOKEN = secrets.token_hex(16)  # One-time token for local API auth
 
 def _inject_token(token):
-    """Replace placeholder with actual token."""
+    """Replace placeholder (empty or old) with actual token."""
     idx_path = os.path.join(SCRIPT_DIR, "index.html")
     try:
         with open(idx_path, "r", encoding="utf-8") as f:
             html = f.read()
-        html = html.replace('let LOCAL_TOKEN = "";', f"let LOCAL_TOKEN = '{token}';")
+        # Replace already-injected token or empty placeholder
+        html = re.sub(r"let LOCAL_TOKEN = '[^']*';", "let LOCAL_TOKEN = '%s';" % token, html)
+        if "let LOCAL_TOKEN = '" not in html:
+            html = html.replace("</script>\n</body>", "<script>let LOCAL_TOKEN = '%s';</script>\n</body>" % token)
         with open(idx_path, "w", encoding="utf-8") as f:
             f.write(html)
     except Exception as e:
-        print(f"  [CSRF] warn: token inject failed: {e}")
+        print("  [CSRF] warn: token inject failed: %s" % e)
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 # ============ Local LLM (llama-cpp-python, optional) ============
@@ -2068,7 +2071,7 @@ def tool_screenshot(region=None):
             img = img.resize((1280, int(h * 1280 / w)), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="PNG", optimize=True)
-        _log_tool_action("screenshot", {"size": img.size}, ok=True)
+        _log_tool_action("screenshot", ok=True, tool="auto")
         return {"ok": True, "image_b64": base64.b64encode(buf.getvalue()).decode(),
                 "size": list(img.size), "format": "png"}
     except ImportError:
@@ -2086,7 +2089,7 @@ def tool_mouse_click(x, y, button="left", clicks=1):
         if not (0 <= x <= sw and 0 <= y <= sh):
             return {"ok": False, "error": f"坐标超出 {sw}x{sh}"}
         pg.click(x=x, y=y, button=button, clicks=clicks, interval=0.15)
-        _log_tool_action("click", {"x": x, "y": y}, ok=True)
+        _log_tool_action("click", ok=True, tool="auto")
         return {"ok": True, "x": x, "y": y, "button": button}
     except ImportError:
         return {"ok": False, "error": "pip install pyautogui pillow"}
@@ -2107,7 +2110,7 @@ def tool_type_text(text, interval=0.05):
             import subprocess
             subprocess.run(["clip"], input=text.encode("utf-16-le") + b"\x00\x00", check=True)
             pg.hotkey("ctrl", "v")
-        _log_tool_action("type_text", {"chars": len(text)}, ok=True)
+        _log_tool_action("type_text", ok=True, tool="auto")
         return {"ok": True, "chars": len(text)}
     except ImportError:
         return {"ok": False, "error": "pip install pyautogui pillow"}
@@ -2122,11 +2125,11 @@ def tool_hotkey(*keys):
                for c in [["ctrl","alt","delete"], ["ctrl","alt","del"],
                          ["win","r"], ["meta","r"]]}
     if frozenset(k.lower() for k in keys) in blocked:
-        return {"ok": False, "error": f"快捷键 {'+'.join(keys)} 被安全策略阻止"}
+        return {"ok": False, "error": "快捷键 %s 被安全策略阻止" % '+'.join(keys)}
     try:
         import pyautogui as pg
         pg.hotkey(*keys)
-        _log_tool_action("hotkey", {"keys": list(keys)}, ok=True)
+        _log_tool_action("hotkey", ok=True, tool="auto")
         return {"ok": True, "keys": list(keys)}
     except ImportError:
         return {"ok": False, "error": "pip install pyautogui pillow"}
@@ -2138,7 +2141,7 @@ def tool_browser_open(url, new_tab=True):
     try:
         import webbrowser
         webbrowser.open(url, new=1 if new_tab else 0)
-        _log_tool_action("browser_open", {"url": url}, ok=True)
+        _log_tool_action("browser_open", ok=True, tool="auto")
         return {"ok": True, "url": url}
     except Exception as e:
         return {"ok": False, "error": str(e)[:200]}
@@ -2172,7 +2175,7 @@ def tool_task_create(interval, action, label=""):
     _AUTO_TASKS[tid] = {"interval": interval, "action": action, "timer": t,
                          "running": True, "label": label}
     t.start()
-    _log_tool_action("task_create", {"id": tid, "action": action}, ok=True)
+    _log_tool_action("task_create", ok=True, tool="auto")
     return {"ok": True, "taskId": tid}
 
 def tool_task_stop(task_id):
@@ -2183,7 +2186,7 @@ def tool_task_stop(task_id):
         t["running"] = False
         try: t["timer"].cancel()
         except: pass
-        _log_tool_action("task_stop", {"id": task_id}, ok=True)
+        _log_tool_action("task_stop", ok=True, tool="auto")
         return {"ok": True}
     return {"ok": False, "error": f"任务 {task_id} 不存在"}
 
@@ -2467,6 +2470,12 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         if not url:
             self._send_json({"error": "缺少 url 参数"}, status=400)
             return
+        # Safety: only http/https schemes
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            self._send_json({"error": f"不允许的协议: {parsed.scheme}"}, status=400)
+            return
         result = tool_browser_open(url, new_tab=body.get("newTab", True))
         self._send_json(result)
 
@@ -2476,7 +2485,7 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         if not self._require_auto_token(): return
         body = self._read_body()
         if "enabled" in body:
-            _AUTO_ENABLED = bool(body["enabled"])
+            _AUTO_ENABLED = str(body["enabled"]).lower() in ("true", "1", "yes")
             print(f"  [AUTO] {'ENABLED' if _AUTO_ENABLED else 'DISABLED'}")
         deps = _check_auto_deps()
         self._send_json({"ok": True, "enabled": _AUTO_ENABLED,
