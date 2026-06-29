@@ -30,17 +30,73 @@ except ImportError:
     import math as np  # Fallback: math.log, math.exp work as numpy equivalents for scalars
 
 PORT = 8082
-_DDG_FAILURES = 0  # Circuit breaker: skip DDG after 2 consecutive failures
-_DDG_FAILURE_LOCK = threading.Lock()
+
+# ============ Engine Health Tracker ============
+_ENGINE_FAILS = {'DDG': 0, 'Bing': 0, 'Sogou': 0}
+_ENGINE_FAIL_THRESHOLD = 3
+_ENGINE_LOCK = threading.Lock()
+
+def _engine_ok(name):
+    with _ENGINE_LOCK:
+        return _ENGINE_FAILS.get(name, 0) < _ENGINE_FAIL_THRESHOLD
+
+def _engine_success(name):
+    with _ENGINE_LOCK:
+        _ENGINE_FAILS[name] = 0
+
+def _engine_fail(name):
+    with _ENGINE_LOCK:
+        _ENGINE_FAILS[name] = _ENGINE_FAILS.get(name, 0) + 1
+        if _ENGINE_FAILS[name] == _ENGINE_FAIL_THRESHOLD:
+            print(f"  [ENGINE] {name} disabled after {_ENGINE_FAIL_THRESHOLD} consecutive failures")
+
+# ============ Search Constants ============
 JUNK_DOMAINS = ['baike.baidu.com','baike.sogou.com','zh.wikipedia.org','hanyuguoxue.com','chagushici.com','zidian.gushici.net','shidianguji.com','zdic.net','cidian.com','jinyici.com','fangfahui.com','qjyule.com','zhihu.com/topic']
 DIRECT_ENGINES = {'GoldAPI','OpenER','OpenMeteo','Wikipedia','GoogleNews','BingNews','Kitco','00038'}
 # Domains blocked by anti-bot — skip fetch, use search snippet directly
 SNIPPET_ONLY_DOMAINS = {'zhihu.com','zhuanlan.zhihu.com','thepaper.cn','dw.com','baijiahao.baidu.com','tieba.baidu.com','wenku.baidu.com','zhidao.baidu.com'}
 # Accessible Chinese news domains for targeted search (Bing site: operator)
 CHINA_NEWS_DOMAINS = ['news.sina.com.cn','news.163.com','news.sohu.com','ifeng.com','news.qq.com','huanqiu.com','guancha.cn','zaobao.com','news.cctv.com','xinhuanet.com','chinanews.com.cn','ltn.com.tw','theinitium.com']
+CHINA_EDU_DOMAINS = ['gaokao.chsi.com.cn','gaokao.com','eol.cn','exam100.cn','sooxue.com','zhongkao.com','jiaoyu.cn','edu.sina.com.cn','edu.163.com','gaokao.qq.com','edushi.com']
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, "data.db")
 ERROR_LOG = os.path.join(SCRIPT_DIR, "docs", "ERROR_LOG.md")
+
+# ============ Static Vendor Assets (offline-first) ============
+_VENDOR_DIR = os.path.join(SCRIPT_DIR, "static", "vendor")
+_VENDOR_ASSETS = {
+    "marked.min.js":        "https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js",
+    "katex.min.js":         "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js",
+    "katex.min.css":        "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css",
+    "highlight.min.js":     "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js",
+    "github.min.css":       "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css",
+    "github-dark.min.css":  "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css",
+}
+
+def _ensure_vendor_assets():
+    """Download missing vendor assets for offline use. Runs once at startup."""
+    os.makedirs(_VENDOR_DIR, exist_ok=True)
+    missing = [k for k, v in _VENDOR_ASSETS.items() if not os.path.exists(os.path.join(_VENDOR_DIR, k))]
+    if not missing:
+        print(f"  [VENDOR] All {len(_VENDOR_ASSETS)} assets cached locally")
+        return
+    print(f"  [VENDOR] Downloading {len(missing)} missing assets...")
+    ok = 0
+    for name in missing:
+        url = _VENDOR_ASSETS[name]
+        dest = os.path.join(_VENDOR_DIR, name)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "USB-AI/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = r.read()
+            with open(dest, "wb") as f:
+                f.write(data)
+            print(f"    ✓ {name} ({len(data)//1024}KB)")
+            ok += 1
+        except Exception as e:
+            print(f"    ✗ {name}: {e}")
+    print(f"  [VENDOR] {ok}/{len(missing)} downloaded")
+
 
 def log_error(module, error_type, description):
     try:
@@ -297,15 +353,11 @@ def _decode_bing_url(encoded):
         return None
 
 def _ddg_search(query, num=5):
-    """DuckDuckGo Instant Answer API (free, no key needed)
-    With retry + Content-Type check + graceful degradation + circuit breaker."""
+    """DuckDuckGo with retry + Content-Type check + engine health."""
     results = []
-    global _DDG_FAILURES
-    # Circuit breaker: skip DDG if failed 2+ times consecutively
-    with _DDG_FAILURE_LOCK:
-        if _DDG_FAILURES >= 2:
-            print(f"  [DDG] circuit breaker open ({_DDG_FAILURES} failures), skipping")
-            return results
+    if not _engine_ok("DDG"):
+        print(f"  [DDG] engine disabled ({_ENGINE_FAILS.get('DDG',0)} failures), skipping")
+        return results
     max_retries = 3
     last_error = ""
 
@@ -317,7 +369,6 @@ def _ddg_search(query, num=5):
             with urllib.request.urlopen(req, timeout=10) as resp:
                 ct = resp.headers.get("Content-Type", "")
                 if "json" not in ct:
-                    # DDG returned non-JSON (HTML block page, rate-limited, etc.)
                     last_error = f"Non-JSON response: {ct.split(';')[0]}"
                     if attempt < max_retries - 1:
                         wait = 2 ** attempt
@@ -333,12 +384,10 @@ def _ddg_search(query, num=5):
             if data.get("AbstractText"):
                 results.append({"title": data.get("Heading", query), "url": data.get("AbstractURL", ""),
                                 "snippet": data["AbstractText"], "engine": "DuckDuckGo"})
-            # RelatedTopics can have nested arrays
             topics = data.get("RelatedTopics") or []
             for topic in topics:
                 if len(results) >= num: break
                 if isinstance(topic, dict):
-                    # Some topics have nested 'Topics' array
                     if "Topics" in topic and isinstance(topic["Topics"], list):
                         for sub in topic["Topics"]:
                             if len(results) >= num: break
@@ -350,7 +399,7 @@ def _ddg_search(query, num=5):
                         results.append({"title": (topic.get("FirstURL") or "").split("/")[-1].replace("_", " ") or query,
                                         "url": topic.get("FirstURL", ""), "snippet": topic["Text"],
                                         "engine": "DuckDuckGo"})
-            break  # Success — exit retry loop
+            break
 
         except json.JSONDecodeError as e:
             last_error = f"JSON decode failed: {e}"
@@ -370,16 +419,15 @@ def _ddg_search(query, num=5):
             last_error = str(e)[:200]
             print(f"  [DDG] {type(e).__name__}: {last_error}")
             log_error("search", "DDG", last_error)
-            break  # Non-retryable error, exit immediately
+            break
 
     if last_error and not results:
         print(f"  [DDG] exhausted: {last_error}")
         log_error("search", "DDG", last_error[:200])
-        with _DDG_FAILURE_LOCK:
-            _DDG_FAILURES += 1
+        _engine_fail("DDG")
     else:
-        with _DDG_FAILURE_LOCK:
-            _DDG_FAILURES = max(0, _DDG_FAILURES - 1)
+        if results:
+            _engine_success("DDG")
     return results
 
 def _bing_search(query, num=5):
@@ -417,6 +465,9 @@ def _bing_search(query, num=5):
             results.append({"title": title, "url": url, "snippet": snippet, "engine": "Bing"})
     except Exception as e:
         print(f"  [Bing] {e}", file=sys.stderr); log_error("search", "Bing", str(e)[:200])
+        _engine_fail("Bing")
+    else:
+        if results: _engine_success("Bing")
     return results
 
 def _sogou_search(query, num=5):
@@ -449,6 +500,9 @@ def _sogou_search(query, num=5):
             results.append({"title": title, "url": url, "snippet": snippet, "engine": "Sogou"})
     except Exception as e:
         print(f"  [Sogou] {type(e).__name__}", file=sys.stderr); log_error("search", "Sogou", str(e)[:200])
+        _engine_fail("Sogou")
+    else:
+        if results: _engine_success("Sogou")
     return results
 
 # ============ Chinese Tokenizer ============
@@ -816,6 +870,21 @@ def search_news(query):
     return results
 
 
+def search_edu(query):
+    """Targeted search over Chinese education domains via Sogou site: operator."""
+    results = []
+    try:
+        site_filter = ' OR '.join(f'site:{d}' for d in CHINA_EDU_DOMAINS[:6])
+        edu_query = f'({query}) {site_filter}'
+        cn_results = _sogou_search(edu_query, num=5)
+        if cn_results:
+            for r in cn_results:
+                r["engine"] = "EduSite"
+            results = cn_results
+    except: pass
+    return results
+
+
 def search_gold_price():
     """Fetch live commodity prices from free APIs (GoldAPI + Binance)."""
     results = []
@@ -940,10 +1009,16 @@ def web_search(query, num=10, timeout=10):
     Uses only Python standard library.
     """
     import concurrent.futures
-    engines = [_ddg_search, _bing_search, _sogou_search]
+    _all_engines = [_ddg_search, _bing_search, _sogou_search]
+    _engine_names = {'_ddg_search': 'DDG', '_bing_search': 'Bing', '_sogou_search': 'Sogou'}
+    engines = [fn for fn in _all_engines if _engine_ok(_engine_names.get(fn.__name__, fn.__name__))]
+    if not engines:
+        for k in _ENGINE_FAILS: _ENGINE_FAILS[k] = 0
+        engines = _all_engines
+        print("  [ENGINE] All engines disabled — resetting health counters")
     all_results = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(engines)) as ex:
         futures = {ex.submit(fn, query, num): fn.__name__ for fn in engines}
         done, _ = concurrent.futures.wait(futures, timeout=timeout)
         for fut in done:
@@ -1857,6 +1932,25 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         """Serve static files + DB API GET"""
+        # Serve locally cached vendor assets (offline-first)
+        if self.path.startswith("/static/"):
+            rel = self.path[len("/static/"):]
+            local = os.path.join(_VENDOR_DIR, rel)
+            if os.path.isfile(local):
+                ext = os.path.splitext(local)[1].lower()
+                ct = {".js": "application/javascript", ".css": "text/css"}.get(ext, "application/octet-stream")
+                with open(local, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_error(404)
+            return
+
         # Health check + diagnostics
         if self.path == "/api/diag":
             diag = {}
@@ -2132,11 +2226,38 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             query = optimize_query(raw_query)
             print(f"  [search] raw={raw_query[:60]} -> q={query[:60]}")
             results = web_search(query, num=num)
-            if not results and _STRIP_WORDS:
-                pass  # fall through to retries
+
+            # === Zero-result recovery chain ===
+            if not results:
+                # Level 1: try news search (better at recent events)
+                news_query = raw_query
+                # For exam queries, add Chinese news site context
+                if any(k in raw_query for k in ["中考","高考","真题","试题","作文","分数线","录取","成绩"]):
+                    news_query = raw_query + " 广西 教育"
+                results = search_news(news_query)
+                print(f"  [search] news fallback: {len(results)} results")
+
+            if not results:
+                # Level 2: broaden query — remove year/location specificity
+                broadened = re.sub(r'(20\d{2}[年]?|广西|广东|北京|上海|浙江|江苏|山东|四川|湖南|湖北|福建|河南|河北|江西|安徽|重庆|天津|辽宁|吉林|黑龙江|山西|陕西|云南|贵州|甘肃|青海|海南|西藏|宁夏|新疆|内蒙古)', '', raw_query)
+                broadened = re.sub(r'\s+', ' ', broadened).strip()
+                if broadened and broadened != raw_query and len(broadened) > 4:
+                    print(f"  [search] broaden: {broadened[:60]}")
+                    results = web_search(broadened, num=num)
+
+            if not results:
+                # Level 3: original raw query (no optimize)
+                raw_stripped = re.sub(r'[？?！!。，,、\s]+', ' ', raw_query).strip()
+                if raw_stripped != query and len(raw_stripped) > 4:
+                    print(f"  [search] raw fallback: {raw_stripped[:60]}")
+                    results = web_search(raw_stripped, num=num)
+
             if "天气" in raw_query: results = search_weather(raw_query) + results
             if any(k in raw_query for k in ["什么是","是谁","百科","定义"]): results = search_wiki(raw_query) + results
-            if any(k in raw_query for k in ["新闻","最新"]): results = search_news(raw_query) + results
+            if any(k in raw_query for k in ["新闻","最新"]):
+                results = search_news(raw_query) + results
+            if any(k in raw_query for k in ["中考","高考","真题","试题","作文","分数线","录取","成绩"]):
+                results = search_news(raw_query) + search_edu(raw_query) + results
             for _tags, _fn, _need_raw in [
                 (["黄金","金价","白银","铂金","铜价","钯金","比特币","以太坊","加密货币","狗狗币","BTC","ETH"], search_gold_price, False),
                 (["原油","石油","油价","WTI","布伦特","Brent","燃料油"], search_oil_price, False),
@@ -2472,7 +2593,7 @@ Current Date: {_now.strftime('%Y-%m-%d')}
 
             # Regex-based classification (fast, no API cost)
             lottery_re = r'彩票|开奖|号码|快乐8|大乐透|双色球|排列|福彩|体彩|中奖|选五|选九|选十'
-            realtime_re = r'天气|股价|股票|汇率|新闻|最新|今天|现在|实时|比分|赛程|比赛|世界杯|欧冠|NBA|足球|篮球|网球|F1|奥运|金牌|金牌榜'
+            realtime_re = r'天气|股价|股票|汇率|新闻|最新|今天|现在|实时|比分|赛程|比赛|世界杯|欧冠|NBA|足球|篮球|网球|F1|奥运|金牌|金牌榜|高考|中考|真题|试题|作文|分数线|录取|成绩|体育|中超|英超|西甲|意甲|亚运|冠军|电竞|汽车|车型|新能源|电动车|特斯拉|续航|电器|家电|电视|冰箱|洗衣机|空调|电脑|编程|代码|开发|芯片|半导体|软件|军事|军队|武器|导弹|航母|国防|科技|科学|航天|太空|火箭|人工智能|机器学习|量子'
             financial_re = r'股票|股价|基金|A股|港股|美股|纳斯达克|道指|标普|恒生|上证|深证|黄金|白银|原油|比特币|以太坊|期货|外汇|利率|CPI|GDP|通胀'
 
             if re.search(lottery_re, query): intent = 'lottery'
@@ -2735,6 +2856,8 @@ def main():
     # Inject LOCAL_TOKEN into index.html for CSRF protection
     _inject_token(LOCAL_TOKEN)
     print(f"  [CSRF] token injected: {LOCAL_TOKEN[:8]}...")
+    # Pre-cache vendor assets for offline use
+    _ensure_vendor_assets()
 
 
     # Use ThreadingMixIn so long requests don't block Ctrl+C

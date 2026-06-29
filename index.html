@@ -4,9 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>USB-AI v4</title>
-<link rel="stylesheet" href="style.css?v=13">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css" id="hl-theme">
+<link rel="stylesheet" href="style.css?v=14">
+<script>
+(function(){var l='/static/vendor/katex.min.css',c='https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css';var e=document.createElement('link');e.rel='stylesheet';e.href=l;e.onerror=function(){var f=document.createElement('link');f.rel='stylesheet';f.href=c;document.head.appendChild(f)};document.head.appendChild(e)})();
+(function(){var l='/static/vendor/github.min.css',c='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css';var e=document.createElement('link');e.rel='stylesheet';e.href=l;e.id='hl-theme';e.setAttribute('data-fallback',c);document.head.appendChild(e)})();
+</script>
 </head>
 <body class="light">
 <div id="bar">
@@ -44,10 +46,10 @@
     <div id="input-wrap"><textarea id="input" placeholder="输入消息…" rows="1"></textarea><button id="send" onclick="send()">发送</button></div>
   </div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
-<script src="conversation-manager.js?v=13"></script>
-<script src="app.js?v=13"></script>
+<script src="conversation-manager.js?v=14"></script>
+<script src="app.js?v=14"></script>
+<script>
+(function(){['marked.min.js','katex.min.js','highlight.min.js'].forEach(function(n){var l='/static/vendor/'+n,cdns={'marked.min.js':'https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js','katex.min.js':'https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js','highlight.min.js':'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js'};var s=document.createElement('script');s.src=l;s.onerror=function(){var f=document.createElement('script');f.src=cdns[n];document.body.appendChild(f)};document.body.appendChild(s)})})();
+</script>
 </body>
 </html>

@@ -2,9 +2,9 @@ let theme=localStorage.getItem('uai_theme')||'light',think=false,search=false,bu
 const _isServer=location.protocol!=='file:';
 function _dateStr(){const t=new Date();return t.getFullYear()+'年'+(t.getMonth()+1)+'月'+t.getDate()+'日'}
 function _recordMsg(r,c){addMsg(r,c);hist.push({role:r,content:c});CM.appendMessage(r,c)}
-const REALTIME_RE=new RegExp(['最新','实时','今天','现在','新闻','价格','天气','开奖','彩票','快乐8','大乐透','双色球','比分','赛程','股价','股票','汇率','黄金','白银','比特币','以太坊','期货','原油','石油','铜价','大豆','外汇','利率','考试','高考','AI','大模型','DeepSeek','Claude','GPT','显卡','CPU','内存','装机','直播','附近','路况','限行','预警','地震','多少钱','性价比','评测','买车','落地价','报价','配置','保养','保险','油耗','二手','回收价','手机','iPhone','华为','小米','OPPO','vivo','三星','折叠屏'].join('|'));
+const REALTIME_RE=new RegExp(['最新','实时','今天','现在','新闻','价格','天气','开奖','彩票','快乐8','大乐透','双色球','比分','赛程','股价','股票','汇率','黄金','白银','比特币','以太坊','期货','原油','石油','铜价','大豆','外汇','利率','考试','高考','中考','真题','试题','作文','分数线','AI','大模型','DeepSeek','Claude','GPT','显卡','CPU','内存','装机','直播','附近','路况','限行','预警','地震','多少钱','性价比','评测','买车','落地价','报价','配置','保养','保险','油耗','二手','回收价','手机','iPhone','华为','小米','OPPO','vivo','三星','折叠屏','体育','中超','英超','西甲','意甲','奥运','亚运','冠军','金牌','银牌','铜牌','联赛','电竞','汽车','车型','新能源','电动车','特斯拉','比亚迪','续航','充电','电器','家电','电视','冰箱','洗衣机','空调','耳机','音箱','相机','电脑','编程','代码','开发','芯片','半导体','软件','服务器','军事','军队','武器','导弹','航母','国防','科技','科学','航天','太空','火箭','人工智能','机器学习','量子'].join('|'));
 function _isRealtime(txt){return REALTIME_RE.test(txt)}
-function tglTheme(){theme=theme=='light'?'dark':'light';document.body.className=theme;localStorage.setItem('uai_theme',theme);document.getElementById('hl-theme').href=theme=='dark'?'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css':'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css'}
+function tglTheme(){theme=theme=='light'?'dark':'light';document.body.className=theme;localStorage.setItem('uai_theme',theme);var el=document.getElementById('hl-theme');el.href=theme=='dark'?'/static/vendor/github-dark.min.css':'/static/vendor/github.min.css';el.onerror=function(){el.href=el.getAttribute('data-fallback')||(theme=='dark'?'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css':'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css')}}
 document.body.className=theme;
 function tglSide(){sideOpen=!sideOpen;document.getElementById('side').classList.toggle('open',sideOpen)}
 function openSet(){document.getElementById('modal').classList.add('show')}
@@ -201,7 +201,7 @@ function needSearch(txt){
   return triggers.some(k=>txt.includes(k));
 }
 // Intent Router
-function classify(txt){if(/彩票|开奖|号码|快乐8|大乐透|双色球|排列|福彩|体彩|中奖/.test(txt))return'lottery';if(/天气|股价|股票|汇率|新闻|最新|今天|现在|实时|比分|赛程|比赛|世界杯|欧冠|NBA/.test(txt))return'realtime';return'general';}
+function classify(txt){if(/彩票|开奖|号码|快乐8|大乐透|双色球|排列|福彩|体彩|中奖/.test(txt))return'lottery';if(/天气|股价|股票|汇率|新闻|最新|今天|现在|实时|比分|赛程|比赛|世界杯|欧冠|NBA|高考|中考|真题|试题|分数线|录取|成绩|体育|中超|英超|汽车|车型|新能源|电动车|特斯拉|电器|家电|电视|电脑|编程|芯片|半导体|军事|军队|武器|科技|科学|航天|人工智能/.test(txt))return'realtime';return'general';}
 function apiUrl(){return location.protocol=='file:'?'https://api.deepseek.com/v1/chat/completions':'/api/deepseek'}
 function streamUrl(){return location.protocol=='file:'?null:'/api/deepseek/stream'}
 function apiHd(k){return location.protocol=='file:'?{'Content-Type':'application/json',Authorization:'Bearer '+k}:{'Content-Type':'application/json','X-API-Key':k}}
@@ -241,7 +241,7 @@ async function doSend(txt){
     if(location.protocol!=='file:'){try{const r=await fetch('/api/classify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:txt}),signal:AbortSignal.timeout(2000)});if(r.ok){const d=await r.json();if(d.intent)intent=d.intent}}catch(e){}}
     if(rag){sp+='\n\n以下是已经为你搜索到的实时数据。⚠️铁律：你绝对不要说"我无法联网/无法获取实时数据/没有搜索结果"——搜索已完成，数据在下面。你必须基于这些数据直接回答。\n⚠️禁止批评用户的用词或术语——即便你觉得表述不准确，也要理解意图后回答，不可说教。\n\n'+rag}
     else if(doSearch){const urls=_trustedSources(txt);sp+='\n\n（搜索未获取数据。⚠️禁止说教用户"这个表述存在误导"或"你应该查权威来源"——理解用户意图比纠正用词更重要。\n用你的知识回答核心问题。如果确实超出知识范围，用 [SEARCH:改写后的查询词] 换一个角度搜索。'+(urls.length?'可信网站：\n'+urls.join('\n'):'')+'）'}
-    else{sp+='\n\n你是全能顾问，风格专业犀利有幽默感。\n你的知识截止于2025年7月，今天已是'+ds+'。\n⚠️铁律1：当用户问2025年7月后的时事/战争/选举/政策/灾难/名人动向/科技发布——必须第一行写 [SEARCH:关键词] 主动搜索，不得用"我的知识截止于XX"或"你告诉我"推给用户。\n⚠️铁律2：永远不要说"你这个表述存在误导"或"你应该去查权威新闻源"——理解用户意图，用你的知识或搜索结果直接回答核心问题。用户不是来上术语课的。时效性=可信度。\n你有搜索工具：[SEARCH:查询关键词] 系统自动搜索。搜索无结果时，换关键词重搜，不要放弃。\n⚠️禁止"我无法联网/无法获取实时数据/我搜索不到"——工具在你手里，搜不到就换词重搜。\n知识覆盖：高中全科、计算机/网络、电竞/直播/二次元、民间俚语/方言梗、自驾游/路线。对历史/未来/科技/人文/宗教好奇但务实。理解当代社会压力，接地气不说道。规则：模糊问题先确认意图；不编造网址/人名/电话；简洁、少用"您"、拒绝客服体。'}
+    else{sp+='\n\n你是全能顾问，风格专业犀利有幽默感。\n你的知识截止于2025年7月，今天已是'+ds+'。\n⚠️铁律1：当用户问2025年7月后的时事/战争/选举/政策/灾难/名人动向/科技发布/考试/真题/试题/作文/分数线/录取——必须第一行写 [SEARCH:关键词] 主动搜索，不得用"我的知识截止于XX"或"你告诉我"推给用户。\n⚠️铁律2：永远不要说"你这个表述存在误导"或"你应该去查权威新闻源"——理解用户意图，用你的知识或搜索结果直接回答核心问题。用户不是来上术语课的。时效性=可信度。\n⚠️铁律3：已经结束的中考、高考、各类考试真题是公开信息。搜索到结果后直接回答，不得以"提前知道真题是违法的"或"无法提供"为由拒绝回答——考试已结束，真题已公开。\n你有搜索工具：[SEARCH:查询关键词] 系统自动搜索。搜索无结果时，换关键词重搜，不要放弃。\n⚠️禁止"我无法联网/无法获取实时数据/我搜索不到"——工具在你手里，搜不到就换词重搜。\n知识覆盖：高中全科、计算机/网络、电竞/直播/二次元、民间俚语/方言梗、自驾游/路线。对历史/未来/科技/人文/宗教好奇但务实。理解当代社会压力，接地气不说道。规则：模糊问题先确认意图；不编造网址/人名/电话；简洁、少用"您"、拒绝客服体。'}
     // Compress history to last 8 messages (~saves 60% tokens)
     const msgs=[{role:'system',content:sp},..._compressHistory()];
     const estTotal=_estTokens(sp)+_estTokens(msgs.slice(1).map(m=>m.content).join(' '));
