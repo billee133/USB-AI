@@ -36,7 +36,8 @@
       </optgroup>
       <optgroup id="local-llm-group" label="llama-cpp 本地"></optgroup>
     </select>
-    <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--txt);margin-bottom:10px;cursor:pointer"><input type="checkbox" id="debug-toggle" onchange="toggleDebug()"> 显示调试日志</label>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--txt);margin-bottom:4px;cursor:pointer"><input type="checkbox" id="debug-toggle" onchange="toggleDebug()"> 显示调试日志</label>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--txt);margin-bottom:10px;cursor:pointer"><input type="checkbox" id="auto-toggle" onchange="toggleAuto()"> 🤖 桌面自动化 <span id="auto-status" style="font-size:10px;color:var(--txd)">检测中...</span></label>
     <div class="acts"><button onclick="closeSet()">取消</button><button class="pri" onclick="saveSet()">保存</button></div>
   </div>
 </div>
@@ -63,6 +64,6 @@
 // Populate local LLM models from server
 if(location.protocol!=='file:'){fetch('/api/local-llm/status').then(function(r){return r.json()}).then(function(d){var g=document.getElementById('local-llm-group');if(!g||!d.models||!d.models.length)return;d.models.forEach(function(p){var o=document.createElement('option');var n=p.split('/').pop().split('\\').pop();o.value='_local_'+n;o.textContent=n;if(d.loaded&&d.modelPath===p)o.selected=true;g.appendChild(o)})}).catch(function(){})}
 </script>
-<script>let LOCAL_TOKEN = '373f1c705ace33161568a5b8450ae9cb';</script>
+<script>let LOCAL_TOKEN = '0ad8bcb898574f19ccf4a15882abcb4c';</script>
 </body>
 </html>
