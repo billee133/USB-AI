@@ -1,6 +1,6 @@
 # CLAUDE.md — USB-AI
 
-> AI 助手行为准则 · v4.3
+> AI 助手行为准则 · v4.5.1
 
 ## 代码风格
 
@@ -42,6 +42,39 @@
 - 新闻搜索三级回退：Google News → Bing News → Sogou site: 中文站
 - 地缘政治查询：自动拆词 + 英文回退 + 跳过相关性过滤
 - 反爬域名（知乎/澎湃/百度系）→ 不用 fetch，直接用搜索片段
+- DuckDuckGo 熔断器：连续失败2次后本会话跳过（DDG 已永久返回非JSON）
+- 上下文压缩用 BM25 评分（TF·IDF + 长度归一化），替代关键词计数
+- RAG 上下文注入搜索时间（Search Time / Current Date）辅助时效判断
+- 年份/期号保护：`\b\d{1,2}\b` 只过滤1-2位数字，保留 3+ 位（年份2025、期号24101等）
+
+## AI 提取策略
+
+- `ai_extract()` 发送压缩文本到 DeepSeek，替代硬编码正则
+- 架构：缓存(MD5指纹+TTL 10min+LRU 128条) → AI请求 → JSON解析 → 缓存写入
+- schema 自动检测：lottery/sports/financial/tabular/generic，按 query 关键词匹配
+- 回落链：AI提取 → 正则提取 → 原始文本直传 → 搜索片段，四级降级，用户永不见"提取失败"
+- 彩票查询优先 AI 提取（00038.cn HTML），失败回落 huiniao.top API 再回落正则
+- 通用摘要：每篇 fetched page 先走 `ai_extract()`，失败再用 `generate_summary()` 正则
+- Token 成本：~500-800 tokens/次，DeepSeek ~$0.28/1M input ≈ $0.0002/次
+- prompt 铁则：只输出 JSON，不解释，不臆造，无代码块；温度 0.1；max_tokens 1024
+
+## 工具安全规则
+
+- 路径沙箱：所有文件操作 restricted to `workspace/ data/ uploads/`，realpath 解析后前缀白名单
+- 系统路径黑名单：`C:\Windows`, `/etc/`, `~/.ssh`, `AppData` 等硬阻断
+- Shell 执行：禁止 `shell=True`，subprocess.run 传列表
+- 命令白名单（16个）：python/pip/git/npm/node/ls/cat/find/grep/wc/echo/which/pwd/head/tail/dir
+- 命令黑名单（40+）：rm/shutdown/format/powershell/curl/wget/ssh/sudo 等
+- 参数正则锚定：每个白名单命令有 args 模式，不匹配拒绝
+- find -exec/-ok/-execdir：硬阻断，防止绕过黑名单执行删除/下载
+- Shell 元字符阻断：`; | \` $() ` 等出现在任何参数中直接拒绝
+- Shell 命令需 API Key：`_handle_tool` 中 type=shell 检查 X-API-Key，文件工具不要求
+- 日志：所有工具调用写入 `data/tool_log.jsonl`（时间/动作/耗时/成功）
+- 文件大小上限：1MB（读取），10KB（输出截断）
+- 审计：全部可追溯，`_log_tool_action()` 统一写入
+- P3 TOOL 协议：SSE 流拦截 `[TOOL:name args]`，自动执行工具，续推理（最多 5 轮）
+- P3 System Prompt 注入：10 个工具描述自动追加到 system message
+- 前端 `_cleanToolMarkers()`：移除显示中的 `[TOOL:]` 标记
 
 ## 模型列表（6个有效）
 

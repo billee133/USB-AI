@@ -53,3 +53,5 @@
 | 2026-06-23 15:19:31 | ERROR | search | Bing | The read operation timed out | 待修复 |
 | 2026-06-23 22:33:11 | ERROR | search | DDG | <urlopen error [Errno 2] No such file or directory> | 待修复 |
 | 2026-06-23 22:33:19 | ERROR | search | Bing | <urlopen error [Errno 2] No such file or directory> | 待修复 |
+| 2026-06-28 20:11:32 | ERROR | search | DDG | Non-JSON response: application/x-javascript | 待修复 |
+| 2026-06-28 20:15:57 | ERROR | search | DDG | Non-JSON response: application/x-javascript | 待修复 |

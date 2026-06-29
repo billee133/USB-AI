@@ -22,6 +22,7 @@ let _dlogMsgs=[];
 function _dlog(tag,msg){const ts=new Date().toLocaleTimeString();const entry=ts+' ['+tag+'] '+msg;_dlogMsgs.push(entry);if(_dlogMsgs.length>20)_dlogMsgs.shift();try{const el=document.getElementById('debug-log');if(el)el.textContent=_dlogMsgs.join('\n')}catch(e){}}
 function esc(s){s=String(s==null?'':s);const m={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return s.replace(/[&<>"']/g,c=>m[c])}
 function scrollChat(){const c=document.getElementById('chat');c.scrollTop=c.scrollHeight}
+function _cleanToolMarkers(t){return t.replace(/\[TOOL:\w+[^\]]*\]/g,'').replace(/\n{3,}/g,'\n\n').trim()}
 // ====== Unified Message Renderer ======
 function renderMessage(rawMarkdown){
   _dlog('RENDER',(rawMarkdown||'').length+'chars marked='+(typeof marked!=='undefined')+' katex='+(typeof katex!=='undefined'));
@@ -231,7 +232,7 @@ async function doSend(txt){
     let rag='';
     const doSearch=route==='search'&&location.protocol!=='file:';_dlog('SEARCH',doSearch?'ON':'SKIP');
     if(doSearch){
-      try{const ac=new AbortController();const t=setTimeout(()=>ac.abort(),15000);const r=await fetch('/api/rag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:txt,num:4,fetch:1,maxChars:1200}),signal:ac.signal});clearTimeout(t);if(r.ok){const d=await r.json();rag=d.context||'';_dlog('RAG','ctx='+rag.length+'chars src='+(d.sources||[]).length+' engines='+(d.engines||[]).join(','));stat('搜索完成 · '+(d.searchResults||[]).length+'条'+(rag.length>50?' ✓':' ⚠'))}else{_dlog('RAG','HTTP '+r.status)}}catch(e){const em=e.name==='AbortError'?'搜索超时':e.message;_dlog('RAG','fail: '+em);stat('搜索失败: '+em)}
+      try{const ac=new AbortController();const t=setTimeout(()=>ac.abort(),15000);const r=await fetch('/api/rag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:txt,num:8,fetch:5,maxChars:6000}),signal:ac.signal});clearTimeout(t);if(r.ok){const d=await r.json();rag=d.context||'';_dlog('RAG','ctx='+rag.length+'chars src='+(d.sources||[]).length+' engines='+(d.engines||[]).join(','));stat('搜索完成 · '+(d.searchResults||[]).length+'条'+(rag.length>50?' ✓':' ⚠'))}else{_dlog('RAG','HTTP '+r.status)}}catch(e){const em=e.name==='AbortError'?'搜索超时':e.message;_dlog('RAG','fail: '+em);stat('搜索失败: '+em)}
     }
     const today=new Date();const ds=today.getFullYear()+'年'+(today.getMonth()+1)+'月'+today.getDate()+'日';
     // Compact system prompt (~120 chars avg, saved ~40% from old ~300)
@@ -256,12 +257,13 @@ async function doSend(txt){
       let rendered=false;
       tw=setInterval(()=>{if(dp>=full.length){if(done&&!rendered){rendered=true;clearInterval(tw);bb.innerHTML=md(full);stat('完成');cleanup();return}return}dp=Math.min(dp+3,full.length);const t=full.slice(0,dp);bb.innerHTML='<p class="typing">'+esc(t)+'</p><div class="ty"><span></span><span></span><span></span></div>';scroll()},30);
       while(true){const{value,done:rd2}=await rd.read();if(rd2){done=true;break}dbuf+=dc.decode(value,{stream:true});const ls=dbuf.split('\n');dbuf=ls.pop()||'';for(const l of ls){if(!l.startsWith('data: '))continue;const d=l.slice(6).trim();if(d==='[DONE]'){done=true;break}try{const ch=JSON.parse(d);const dl=ch.choices?.[0]?.delta||{};if(dl.content)full+=dl.content}catch(e){}}if(done)break}
+      full=_cleanToolMarkers(full);
       let w=0;while(dp<full.length&&w<10000){await new Promise(r2=>setTimeout(r2,100));w+=100}clearInterval(tw);
       if(full&&!rendered){bb.innerHTML=md(full);stat('完成');scrollChat()}
     }else{
       const r=await fetch(apiUrl(),{method:'POST',headers:apiHd(key),body:JSON.stringify(body)});const d=await r.json();
       if(!r.ok)throw new Error(d.error?.message||'HTTP '+r.status);
-      full=d.choices?.[0]?.message?.content||'(无内容)';bb.innerHTML=md(full);stat('完成');scrollChat();
+      full=_cleanToolMarkers(d.choices?.[0]?.message?.content||'(无内容)');bb.innerHTML=md(full);stat('完成');scrollChat();
     }
     if(full){
       // AI tool-use: detect [SEARCH:query] and execute
@@ -330,13 +332,14 @@ async function _runToolSearch(query, prevMessages, key, mdName, bb){
       const rd=r2.body.getReader();const dc=new TextDecoder();let dbuf='',done=false,dp=0;
       const tw=setInterval(()=>{if(dp>=full.length){if(done){clearInterval(tw);bb.innerHTML=md(full);stat('完成');cleanup();return}return}dp=Math.min(dp+3,full.length);const t=full.slice(0,dp);bb.innerHTML='<p class="typing">'+esc(t)+'</p><div class="ty"><span></span><span></span><span></span></div>';scroll()},30);
       while(true){const{value,done:rd2}=await rd.read();if(rd2){done=true;break}dbuf+=dc.decode(value,{stream:true});const ls=dbuf.split('\n');dbuf=ls.pop()||'';for(const l of ls){if(!l.startsWith('data: '))continue;const d=l.slice(6).trim();if(d==='[DONE]'){done=true;break}try{const ch=JSON.parse(d);const dl=ch.choices?.[0]?.delta||{};if(dl.content)full+=dl.content}catch(e){}}if(done)break}
+      full=_cleanToolMarkers(full);
       let w=0;while(dp<full.length&&w<10000){await new Promise(r2=>setTimeout(r2,100));w+=100}clearInterval(tw);
       if(full)bb.innerHTML=md(full);
     }catch(e){bb.innerHTML='❌ '+esc(e.message);stat('失败','var(--dng)')}
   }else{
     try{const r2=await fetch(apiUrl(),{method:'POST',headers:apiHd(key),body:JSON.stringify(body)});const d2=await r2.json();
       if(!r2.ok)throw new Error(d2.error?.message||'HTTP '+r2.status);
-      full=d2.choices?.[0]?.message?.content||'';bb.innerHTML=md(full);stat('完成');scrollChat();
+      full=_cleanToolMarkers(d2.choices?.[0]?.message?.content||'');bb.innerHTML=md(full);stat('完成');scrollChat();
     }catch(e){bb.innerHTML='❌ '+esc(e.message);stat('失败','var(--dng)')}
   }
   return full;

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 USB-AI — 本地服务器
 解决浏览器直接打开HTML时的跨域(CORS)问题
@@ -17,9 +18,20 @@ import sqlite3
 import threading
 import concurrent.futures
 import hashlib
+import base64 as _b64
 import time
 
+# Performance flag: numpy available for IDF computation?
+try:
+    import numpy as np
+    has_numpy = True
+except ImportError:
+    has_numpy = False
+    import math as np  # Fallback: math.log, math.exp work as numpy equivalents for scalars
+
 PORT = 8082
+_DDG_FAILURES = 0  # Circuit breaker: skip DDG after 2 consecutive failures
+_DDG_FAILURE_LOCK = threading.Lock()
 JUNK_DOMAINS = ['baike.baidu.com','baike.sogou.com','zh.wikipedia.org','hanyuguoxue.com','chagushici.com','zidian.gushici.net','shidianguji.com','zdic.net','cidian.com','jinyici.com','fangfahui.com','qjyule.com','zhihu.com/topic']
 DIRECT_ENGINES = {'GoldAPI','OpenER','OpenMeteo','Wikipedia','GoogleNews','BingNews','Kitco','00038'}
 # Domains blocked by anti-bot — skip fetch, use search snippet directly
@@ -285,38 +297,89 @@ def _decode_bing_url(encoded):
         return None
 
 def _ddg_search(query, num=5):
-    """DuckDuckGo Instant Answer API (free, no key needed)"""
+    """DuckDuckGo Instant Answer API (free, no key needed)
+    With retry + Content-Type check + graceful degradation + circuit breaker."""
     results = []
-    try:
-        params = urllib.parse.urlencode({"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
-        url = f"https://api.duckduckgo.com/?{params}"
-        req = urllib.request.Request(url, headers={"User-Agent": "PortableAI/3.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        if not isinstance(data, dict):
+    global _DDG_FAILURES
+    # Circuit breaker: skip DDG if failed 2+ times consecutively
+    with _DDG_FAILURE_LOCK:
+        if _DDG_FAILURES >= 2:
+            print(f"  [DDG] circuit breaker open ({_DDG_FAILURES} failures), skipping")
             return results
-        if data.get("AbstractText"):
-            results.append({"title": data.get("Heading", query), "url": data.get("AbstractURL", ""),
-                            "snippet": data["AbstractText"], "engine": "DuckDuckGo"})
-        # RelatedTopics can have nested arrays
-        topics = data.get("RelatedTopics") or []
-        for topic in topics:
-            if len(results) >= num: break
-            if isinstance(topic, dict):
-                # Some topics have nested 'Topics' array
-                if "Topics" in topic and isinstance(topic["Topics"], list):
-                    for sub in topic["Topics"]:
-                        if len(results) >= num: break
-                        if isinstance(sub, dict) and sub.get("Text"):
-                            results.append({"title": (sub.get("FirstURL") or "").split("/")[-1].replace("_", " ") or query,
-                                            "url": sub.get("FirstURL", ""), "snippet": sub["Text"],
-                                            "engine": "DuckDuckGo"})
-                elif topic.get("Text"):
-                    results.append({"title": (topic.get("FirstURL") or "").split("/")[-1].replace("_", " ") or query,
-                                    "url": topic.get("FirstURL", ""), "snippet": topic["Text"],
-                                    "engine": "DuckDuckGo"})
-    except Exception as e:
-        print(f"  [DDG] {type(e).__name__}", file=sys.stderr); log_error("search", "DDG", str(e)[:200])
+    max_retries = 3
+    last_error = ""
+
+    for attempt in range(max_retries):
+        try:
+            params = urllib.parse.urlencode({"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
+            url = f"https://api.duckduckgo.com/?{params}"
+            req = urllib.request.Request(url, headers={"User-Agent": "PortableAI/3.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                ct = resp.headers.get("Content-Type", "")
+                if "json" not in ct:
+                    # DDG returned non-JSON (HTML block page, rate-limited, etc.)
+                    last_error = f"Non-JSON response: {ct.split(';')[0]}"
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        print(f"  [DDG] attempt {attempt+1}: {last_error}, retry in {wait}s")
+                        time.sleep(wait)
+                        continue
+                    print(f"  [DDG] all {max_retries} attempts failed: {last_error}")
+                    return results
+                raw = resp.read().decode("utf-8")
+                data = json.loads(raw)
+            if not isinstance(data, dict):
+                return results
+            if data.get("AbstractText"):
+                results.append({"title": data.get("Heading", query), "url": data.get("AbstractURL", ""),
+                                "snippet": data["AbstractText"], "engine": "DuckDuckGo"})
+            # RelatedTopics can have nested arrays
+            topics = data.get("RelatedTopics") or []
+            for topic in topics:
+                if len(results) >= num: break
+                if isinstance(topic, dict):
+                    # Some topics have nested 'Topics' array
+                    if "Topics" in topic and isinstance(topic["Topics"], list):
+                        for sub in topic["Topics"]:
+                            if len(results) >= num: break
+                            if isinstance(sub, dict) and sub.get("Text"):
+                                results.append({"title": (sub.get("FirstURL") or "").split("/")[-1].replace("_", " ") or query,
+                                                "url": sub.get("FirstURL", ""), "snippet": sub["Text"],
+                                                "engine": "DuckDuckGo"})
+                    elif topic.get("Text"):
+                        results.append({"title": (topic.get("FirstURL") or "").split("/")[-1].replace("_", " ") or query,
+                                        "url": topic.get("FirstURL", ""), "snippet": topic["Text"],
+                                        "engine": "DuckDuckGo"})
+            break  # Success — exit retry loop
+
+        except json.JSONDecodeError as e:
+            last_error = f"JSON decode failed: {e}"
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"  [DDG] attempt {attempt+1}: {last_error}, retry in {wait}s")
+                time.sleep(wait)
+                continue
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            last_error = f"{type(e).__name__}: {str(e)[:100]}"
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"  [DDG] attempt {attempt+1}: {last_error}, retry in {wait}s")
+                time.sleep(wait)
+                continue
+        except Exception as e:
+            last_error = str(e)[:200]
+            print(f"  [DDG] {type(e).__name__}: {last_error}")
+            log_error("search", "DDG", last_error)
+            break  # Non-retryable error, exit immediately
+
+    if last_error and not results:
+        print(f"  [DDG] exhausted: {last_error}")
+        log_error("search", "DDG", last_error[:200])
+        with _DDG_FAILURE_LOCK:
+            _DDG_FAILURES += 1
+    else:
+        with _DDG_FAILURE_LOCK:
+            _DDG_FAILURES = max(0, _DDG_FAILURES - 1)
     return results
 
 def _bing_search(query, num=5):
@@ -456,7 +519,7 @@ def optimize_query(user_message, search_context=""):
         q = re.sub(r'\b(球赛|比赛|赛事)\b', ' ', q)
     # Remove single-character leftovers
     q = re.sub(r'[的了是吗呢吧啊呀嘛哦哈嘿诶哎哟噢喔乎哉兮和与跟及或谁哪这那啥咋她他它]+', ' ', q)
-    q = re.sub(r'\b\d+\b', ' ', q, flags=re.ASCII)  # Strip standalone numbers
+    q = re.sub(r'\b\d{1,2}\b', ' ', q, flags=re.ASCII)  # Strip 1-2 digit standalone numbers (keep years 2025, periods 24101)
     # Clean up "X期" lottery pattern leftover
     if '期' in q and any(k in q for k in ['开奖','彩票','号码','kl8','大乐透','双色球','快乐8']):
         q = q.replace('期', ' ')
@@ -510,7 +573,7 @@ def optimize_query(user_message, search_context=""):
 # ============ RAG Context Compressor ============
 def compress_context(text, query, max_chars=2000):
     """
-    Split text into chunks, score relevance against query, keep top chunks.
+    Split text into chunks, score relevance against query using BM25-style scoring.
     Returns compressed context that fits within max_chars budget.
     """
     if not text or len(text) <= max_chars:
@@ -520,6 +583,16 @@ def compress_context(text, query, max_chars=2000):
     q_terms = set(query.lower().split())
     # Use jieba tokenization for Chinese word segmentation
     q_terms.update(tokenize_query(query))
+    # Add Chinese bigrams for finer granularity
+    for i in range(len(query) - 1):
+        if '一' <= query[i] <= '鿿' and '一' <= query[i+1] <= '鿿':
+            q_terms.add(query[i:i+2])
+
+    # Filter short/trivial terms
+    q_terms = {t for t in q_terms if len(t) >= 2}
+
+    if not q_terms:
+        return text[:max_chars]
 
     # Split into chunks: by sentence (。！？\n), with overlap
     chunks = re.split(r'(?<=[。！？\n])', text)
@@ -541,24 +614,52 @@ def compress_context(text, query, max_chars=2000):
     if len(merged) <= 1:
         return text[:max_chars]
 
-    # Score each chunk: count query term overlap
+    # BM25-style scoring: TF · IDFapprox with length normalization
+    num_docs = len(merged)
+    avg_doc_len = sum(len(ch) for ch in merged) / max(num_docs, 1)
+    k1, b = 1.5, 0.75  # BM25 tunable parameters
+
+    # Pre-compute IDF approximation per term
+    # df = how many chunks contain the term
+    df = {}
+    for t in q_terms:
+        count = sum(1 for ch in merged if t in ch.lower())
+        df[t] = count
+
     scored = []
     for ch in merged:
         if len(ch) < 20:
             continue
         ch_lower = ch.lower()
-        score = sum(1 for t in q_terms if t in ch_lower)
-        # Bonus: title/heading-like lines
-        if re.search(r'(开奖|结果|号码|冠军|比分|最新|公布)', ch):
-            score += 3
-        scored.append((score, ch))
+        doc_len = len(ch)
+        bm25_score = 0
+        # BM25 sum over query terms
+        for t in q_terms:
+            if t not in ch_lower:
+                continue
+            tf = ch_lower.count(t)
+            idf_approx = max(0, np.log((num_docs - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5))) if has_numpy else 1.0
+            bm25_score += idf_approx * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * doc_len / avg_doc_len))
+
+        # Bonus: title/heading-like lines (exact match gets high boost)
+        if re.search(r'(开奖|结果|号码|冠军|比分|最新|公布|发布|宣布|报道|据悉|快讯|快报)', ch):
+            bm25_score += 3
+        # Bonus: exact query phrase match
+        if query.lower() in ch_lower:
+            bm25_score += 5
+        # Bonus: multiple distinct query terms co-occur
+        term_hits = sum(1 for t in q_terms if t in ch_lower)
+        if term_hits >= 3:
+            bm25_score += 2
+
+        scored.append((bm25_score, ch))
 
     # Sort by score descending, take top chunks within budget
     scored.sort(key=lambda x: -x[0])
     result = []
     used = 0
     for score, ch in scored:
-        if score == 0:
+        if score < 0.1:
             continue
         if used + len(ch) > max_chars:
             remaining = max_chars - used
@@ -572,6 +673,8 @@ def compress_context(text, query, max_chars=2000):
         return text[:max_chars]
 
     return '\n'.join(result)
+
+
 
 
 def generate_summary(text, query, max_items=6):
@@ -1391,6 +1494,361 @@ def _format_ai_extraction(extracted_items, max_items=6):
     return '\n'.join(lines)
 
 
+# ============ Local Agent Tools (P1: File Tools + P2: Whitelist Shell) ============
+# Path sandbox: all operations restricted to workspace/data/uploads directories.
+_ALLOWED_PATHS = [
+    os.path.join(SCRIPT_DIR, "workspace"),
+    os.path.join(SCRIPT_DIR, "data"),
+    os.path.join(SCRIPT_DIR, "uploads"),
+]
+for _p in _ALLOWED_PATHS:
+    os.makedirs(_p, exist_ok=True)
+
+_BLOCKED_PATTERNS = [
+    r'^C:\\Windows',
+    r'^C:\\Program Files',
+    r'^C:\\Program Files \(x86\)',
+    r'^/etc/', r'^/usr/',
+    r'~/\.ssh', r'~/\.aws', r'~/\.config', r'~/\.gitconfig',
+    r'C:\\Users\\[^\\]+\\\.ssh',
+    r'C:\\Users\\[^\\]+\\AppData',
+]
+
+_SHELL_WHITELIST = {
+    "python": {"args": r'^[a-zA-Z0-9_\-./\\: ]+\.py$', "desc": "Run Python script"},
+    "pip":    {"args": r'^(install|list|show|freeze)\s+[a-zA-Z0-9_\-\.>=<]+$', "desc": "Python package management"},
+    "git":    {"args": r'^(status|log|diff|branch|add|commit|push|pull)\s', "desc": "Git operations"},
+    "npm":    {"args": r'^(install|run|test|build|start)\s', "desc": "NPM package management"},
+    "node":   {"args": r'^[a-zA-Z0-9_\-./\\: ]+\.js$', "desc": "Run JavaScript"},
+    "ls":     {"args": r'^[a-zA-Z0-9_\-./\\: ]*$', "desc": "List directory"},
+    "dir":    {"args": r'^[a-zA-Z0-9_\-./\\: ]*$', "desc": "List directory (Windows)"},
+    "cat":    {"args": r'^[a-zA-Z0-9_\-./\\: ]+$', "desc": "View file"},
+    "type":   {"args": r'^[a-zA-Z0-9_\-./\\: ]+$', "desc": "View file (Windows)"},
+    "find":   {"args": r'^[a-zA-Z0-9_\-./\\: ]+\s', "desc": "Find files"},
+    "grep":   {"args": r'^[a-zA-Z0-9_\-./\\:"]+\s', "desc": "Search file content"},
+    "wc":     {"args": r'^[\-lwc ]+[a-zA-Z0-9_\-./\\: ]+$', "desc": "Count lines/words/chars"},
+    "echo":   {"args": r'^[a-zA-Z0-9_\-./\\: ]+$', "desc": "Output text"},
+    "which":  {"args": r'^[a-zA-Z0-9_\-./\\:]+$', "desc": "Locate executable"},
+    "pwd":    {"args": r'^$', "desc": "Current path"},
+    "head":   {"args": r'^\-n\s+\d+\s+[a-zA-Z0-9_\-./\\: ]+$', "desc": "View file beginning"},
+    "tail":   {"args": r'^\-n\s+\d+\s+[a-zA-Z0-9_\-./\\: ]+$', "desc": "View file end"},
+}
+
+_BLOCKED_COMMANDS = {
+    'rm', 'rd', 'rmdir', 'del', 'erase',
+    'shutdown', 'reboot', 'restart',
+    'format', 'diskpart', 'fdisk', 'mkfs',
+    'net', 'netstat', 'ipconfig', 'route',
+    'powershell', 'pwsh', 'cmd', 'wsl',
+    'sudo', 'su', 'chmod', 'chown', 'chattr',
+    'reg', 'regedit', 'sc', 'taskkill', 'kill',
+    'mount', 'umount', 'dd',
+    'curl', 'wget', 'certutil', 'bitsadmin',
+    'ssh', 'scp', 'sftp',
+    'perl', 'ruby', 'php', 'gcc', 'g++', 'clang', 'make',
+    'eval', 'exec', 'system', 'popen',
+}
+
+_TOOL_LOG = os.path.join(SCRIPT_DIR, "data", "tool_log.jsonl")
+
+
+# P3 TOOL Protocol: AI output [TOOL:name args] → auto-execute → continue stream
+_TOOL_PATTERN = re.compile(r'\[TOOL:(\w+)(?:\s+([^\]]*?))?\]')
+
+_TOOL_NAME_MAP = {
+    "read_file": ("file", "read_file"),
+    "write_file": ("file", "write_file"),
+    "append_file": ("file", "append_file"),
+    "list_directory": ("file", "file_ls"),
+    "create_directory": ("file", "file_mkdir"),
+    "move_file": ("file", "file_mv"),
+    "delete_file": ("file", "file_rm"),
+    "file_info": ("file", "file_stat"),
+    "run_command": ("shell", None),
+    "run_shell": ("shell", None),
+}
+
+_TOOL_SYSTEM_PROMPT = """\n\n## 本地工具调用\n\n你可以使用以下工具操作本地电脑。工具会在你输出调用指令后自动执行，结果会注入对话。\n\n<tool name="read_file" args="path">读取文件内容。path 必须在 workspace/data/uploads 目录内。</tool>\n<tool name="write_file" args="path, content">写入文件，覆盖已存在文件。</tool>\n<tool name="append_file" args="path, content">追加内容到文件末尾。</tool>\n<tool name="list_directory" args="path">列出目录内容。</tool>\n<tool name="create_directory" args="path">创建新目录。</tool>\n<tool name="move_file" args="src, dst">移动或重命名文件。</tool>\n<tool name="delete_file" args="path">删除文件。</tool>\n<tool name="file_info" args="path">获取文件信息（大小、修改时间）。</tool>\n<tool name="run_command" args="command">在沙箱中执行 Shell 命令。仅白名单命令可用（python/pip/git/npm/node/ls/cat/find/grep/wc/echo/which/pwd/head/tail）。</tool>\n\n调用格式：\n[TOOL:read_file path="data/example.txt"]\n[TOOL:run_command command="ls workspace/"]\n\n工具结果会自动注入，继续推理。一次只调用一个工具，等待结果后决定下一步。"""
+
+
+def _log_tool_action(action, ok=True, duration=0, tool="file"):
+    """Log tool usage to data/tool_log.jsonl."""
+    try:
+        from datetime import datetime
+        entry = {
+            "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "user": "local",
+            "tool": tool,
+            "action": str(action)[:100],
+            "ok": ok,
+            "duration": round(duration, 2),
+        }
+        with open(_TOOL_LOG, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
+def _sanitize_path(path):
+    """Resolve and verify path is within allowed directories. Returns canonical path or raises."""
+    resolved = os.path.realpath(path)
+    for allowed in _ALLOWED_PATHS:
+        if resolved.startswith(allowed + os.sep) or resolved == allowed:
+            return resolved
+    raise PermissionError(f"Path not in allowed directories: {path}")
+
+
+def _check_not_blocked(path):
+    """Verify path doesn't match any blocked pattern."""
+    for pat in _BLOCKED_PATTERNS:
+        if re.match(pat, path, re.IGNORECASE):
+            raise PermissionError(f"Blocked path: {path}")
+
+
+def _run_file_tool(tool, params):
+    """Execute file operations within path sandbox. Returns {ok, result?, error?}."""
+    t0 = time.time()
+    try:
+        if tool in ("read_file", "file_read"):
+            path = _sanitize_path(params.get("path", ""))
+            _check_not_blocked(path)
+            if not os.path.isfile(path):
+                return {"ok": False, "error": "Not a file or not found"}
+            if os.path.getsize(path) > 1_000_000:
+                return {"ok": False, "error": "File exceeds 1MB limit"}
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            _log_tool_action(f"read {os.path.basename(path)}", duration=time.time()-t0)
+            return {"ok": True, "content": content[:10000], "truncated": len(content) > 10000}
+
+        elif tool in ("write_file", "file_write"):
+            path = _sanitize_path(params.get("path", ""))
+            _check_not_blocked(path)
+            content = params.get("content", "")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            _log_tool_action(f"write {os.path.basename(path)}", duration=time.time()-t0)
+            return {"ok": True, "size": len(content)}
+
+        elif tool in ("append_file", "file_append"):
+            path = _sanitize_path(params.get("path", ""))
+            _check_not_blocked(path)
+            content = params.get("content", "")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(content)
+            _log_tool_action(f"append {os.path.basename(path)}", duration=time.time()-t0)
+            return {"ok": True, "size": len(content)}
+
+        elif tool in ("list_directory", "file_ls"):
+            path = _sanitize_path(params.get("path", _ALLOWED_PATHS[0]))
+            _check_not_blocked(path)
+            if not os.path.isdir(path):
+                return {"ok": False, "error": "Not a directory"}
+            items = []
+            for entry in os.scandir(path):
+                items.append({
+                    "name": entry.name,
+                    "type": "dir" if entry.is_dir() else "file",
+                    "size": entry.stat().st_size if entry.is_file() else 0,
+                    "modified": entry.stat().st_mtime,
+                })
+            items.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
+            _log_tool_action(f"ls {os.path.basename(path)}", duration=time.time()-t0)
+            return {"ok": True, "items": items[:200], "total": len(items)}
+
+        elif tool in ("create_directory", "file_mkdir"):
+            path = _sanitize_path(params.get("path", ""))
+            _check_not_blocked(path)
+            os.makedirs(path, exist_ok=True)
+            _log_tool_action(f"mkdir {os.path.basename(path)}", duration=time.time()-t0)
+            return {"ok": True, "path": path}
+
+        elif tool in ("move_file", "file_mv"):
+            src = _sanitize_path(params.get("src", ""))
+            dst = _sanitize_path(params.get("dst", ""))
+            _check_not_blocked(src)
+            _check_not_blocked(dst)
+            if not os.path.exists(src):
+                return {"ok": False, "error": "Source not found"}
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.rename(src, dst)
+            _log_tool_action(f"mv {os.path.basename(src)} -> {os.path.basename(dst)}", duration=time.time()-t0)
+            return {"ok": True}
+
+        elif tool in ("delete_file", "file_rm"):
+            path = _sanitize_path(params.get("path", ""))
+            _check_not_blocked(path)
+            if not os.path.exists(path):
+                return {"ok": False, "error": "Not found"}
+            if os.path.isfile(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                os.rmdir(path)
+            else:
+                return {"ok": False, "error": "Not a file or empty directory"}
+            _log_tool_action(f"rm {os.path.basename(path)}", duration=time.time()-t0)
+            return {"ok": True}
+
+        elif tool in ("file_info", "file_stat"):
+            path = _sanitize_path(params.get("path", ""))
+            _check_not_blocked(path)
+            if not os.path.exists(path):
+                return {"ok": False, "error": "Not found"}
+            stat = os.stat(path)
+            info = {
+                "path": path,
+                "size": stat.st_size,
+                "modified": stat.st_mtime,
+                "created": getattr(stat, 'st_ctime', 0),
+                "type": "dir" if os.path.isdir(path) else "file",
+            }
+            _log_tool_action(f"stat {os.path.basename(path)}", duration=time.time()-t0)
+            return {"ok": True, "info": info}
+
+        else:
+            return {"ok": False, "error": f"Unknown tool: {tool}"}
+
+    except PermissionError as e:
+        _log_tool_action(f"{tool} blocked: {e}", ok=False, duration=time.time()-t0)
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        _log_tool_action(f"{tool} error: {e}", ok=False, duration=time.time()-t0)
+        return {"ok": False, "error": str(e)[:200]}
+
+
+def _run_shell_cmd(command, timeout=30, workdir=None):
+    """Execute whitelisted shell command. No shell=True."""
+    t0 = time.time()
+    parts = command.strip().split()
+    if not parts:
+        return {"ok": False, "error": "Empty command"}
+
+    cmd_name = parts[0].lower()
+
+    # 0. Reject shell metacharacters in any argument (; | ` $() $() {} & || &&)
+    _metachar = re.compile(r'[;&|`$(){}\[\]<>]')
+    for p in parts:
+        if _metachar.search(p):
+            _log_tool_action(f"shell meta chars: {command[:80]}", ok=False, tool="shell", duration=time.time()-t0)
+            return {"ok": False, "error": "Shell metacharacters not allowed"}
+
+    # 1. Blocklist check
+    if cmd_name in _BLOCKED_COMMANDS:
+        _log_tool_action(f"shell blocked: {cmd_name}", ok=False, tool="shell", duration=time.time()-t0)
+        return {"ok": False, "error": f"Command blocked: {cmd_name}"}
+
+    # 2. Whitelist check
+    if cmd_name not in _SHELL_WHITELIST:
+        _log_tool_action(f"shell unknown: {cmd_name}", ok=False, tool="shell", duration=time.time()-t0)
+        return {"ok": False, "error": f"Not in whitelist: {cmd_name}"}
+
+    entry = _SHELL_WHITELIST[cmd_name]
+    args_str = ' '.join(parts[1:])
+    if not re.match(entry["args"], args_str):
+        _log_tool_action(f"shell bad args: {cmd_name} {args_str[:50]}", ok=False, tool="shell", duration=time.time()-t0)
+        return {"ok": False, "error": f"Args pattern mismatch: {args_str[:100]}"}
+
+    # 2a. Block -exec/-ok/-execdir in find (bypass blocked commands)
+    if cmd_name == "find":
+        for p in parts[1:]:
+            if p in ("-exec", "-ok", "-execdir"):
+                _log_tool_action(f"shell find -exec blocked: {command[:80]}", ok=False, tool="shell", duration=time.time()-t0)
+                return {"ok": False, "error": "find -exec/-ok not allowed"}
+
+    # 3. Working directory
+    cwd = workdir or _ALLOWED_PATHS[0]
+    os.makedirs(cwd, exist_ok=True)
+
+    # 4. Execute (no shell=True)
+    try:
+        import subprocess
+        result = subprocess.run(
+            parts,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+            env={**os.environ, "PATH": os.environ.get("PATH", "")},
+        )
+        duration = time.time() - t0
+        _log_tool_action(f"shell {command[:100]}", ok=result.returncode == 0, tool="shell", duration=duration)
+        return {
+            "ok": result.returncode == 0,
+            "stdout": result.stdout[:5000],
+            "stderr": result.stderr[:2000],
+            "returnCode": result.returncode,
+            "duration": round(duration, 2),
+        }
+    except subprocess.TimeoutExpired:
+        _log_tool_action(f"shell timeout: {command[:50]}", ok=False, tool="shell", duration=time.time()-t0)
+        return {"ok": False, "error": f"Timeout ({timeout}s)"}
+    except FileNotFoundError:
+        _log_tool_action(f"shell not found: {parts[0]}", ok=False, tool="shell", duration=time.time()-t0)
+        return {"ok": False, "error": f"Command not found: {parts[0]}"}
+    except Exception as e:
+        _log_tool_action(f"shell error: {e}", ok=False, tool="shell", duration=time.time()-t0)
+        return {"ok": False, "error": str(e)[:200]}
+
+
+# ============ P3 TOOL Protocol Helper Functions ============
+
+
+def _parse_tool_args(args_str):
+    """Parse 'key=\"value\" key2=\"value2\"' into dict."""
+    args = {}
+    for m in re.finditer(r'(\w+)="([^"]*)"', args_str):
+        args[m.group(1)] = m.group(2)
+    return args
+
+
+def _execute_tool_from_str(tool_name, args_str, api_key=None):
+    """Parse [TOOL:name args] and execute via local tool system."""
+    mapping = _TOOL_NAME_MAP.get(tool_name)
+    if not mapping:
+        return {"ok": False, "error": f"Unknown tool: {tool_name}"}
+    action_type, tool_method = mapping
+    args = _parse_tool_args(args_str)
+    if action_type == "file":
+        result = _run_file_tool(tool_method, args)
+    elif action_type == "shell":
+        cmd = args.get("command", "")
+        timeout = int(args.get("timeout", "30"))
+        result = _run_shell_cmd(cmd, timeout)
+    else:
+        result = {"ok": False, "error": f"Unknown tool type: {action_type}"}
+    _log_tool_action(f"P3 TOOL: {tool_name}", ok=result.get("ok", False), tool="p3_tool")
+    return result
+
+
+def _fmt_tool_result(tool_name, result):
+    """Format tool execution result as XML for AI continuation."""
+    ok = result.get("ok", False)
+    parts = [f'<tool_result tool="{tool_name}" ok="{str(ok).lower()}">']
+    if result.get("content"):
+        parts.append(result["content"])
+    if result.get("stdout"):
+        parts.append(result["stdout"][:3000])
+    if result.get("stderr"):
+        parts.append(f'<stderr>{result["stderr"][:1000]}</stderr>')
+    if result.get("error"):
+        parts.append(f'<error>{result["error"]}</error>')
+    if result.get("truncated"):
+        parts.append("(output truncated)")
+    parts.append('</tool_result>')
+    return '\n'.join(parts)
+
+
+def _inject_tool_prompt(body_json):
+    """Append TOOL protocol instructions to system message."""
+    for msg in body_json.get("messages", []):
+        if msg.get("role") == "system":
+            msg["content"] += _TOOL_SYSTEM_PROMPT
+            return
+    body_json["messages"].insert(0, {"role": "system", "content": _TOOL_SYSTEM_PROMPT})
+
+
 # ============ AIProxyHandler ============
 
 
@@ -1467,6 +1925,8 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._handle_rag()
         elif self.path == "/api/ai-extract":
             self._handle_ai_extract()
+        elif self.path == "/api/tool":
+            self._handle_tool()
         elif self.path == "/api/classify":
             self._handle_classify()
 
@@ -1483,7 +1943,7 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         return "https://api.deepseek.com/v1/chat/completions", True
 
     def _handle_deepseek_stream(self):
-        """Streaming SSE proxy: passes DeepSeek chunks directly to client."""
+        """Streaming SSE proxy with P3 TOOL protocol support."""
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
         api_key = self.headers.get("X-API-Key", "")
@@ -1492,14 +1952,11 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         body_json["stream"] = True
         model = body_json.get("model", "")
         api_url, needs_auth = self._get_llm_url(model)
-        body = json.dumps(body_json).encode("utf-8")
 
-        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
-        if needs_auth:
-            headers["Authorization"] = f"Bearer {api_key}"
+        # Inject P3 TOOL system prompt into system message
+        _inject_tool_prompt(body_json)
 
-        req = urllib.request.Request(api_url, data=body, headers=headers, method="POST")
-        # Send headers first (single status line)
+        # Send SSE headers
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -1507,25 +1964,82 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", "http://localhost:%d" % PORT))
         self.end_headers()
 
-        # Relay SSE chunks; on failure write error as SSE event (no second status line)
-        try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                while True:
-                    chunk = resp.readline()
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-        except urllib.error.HTTPError as e:
-            self.wfile.write(f'data: {{"error":"HTTP {e.code}"}}\n\n'.encode())
-            self.wfile.write(b'data: [DONE]\n\n')
-            self.wfile.flush()
-        except Exception as e:
-            self.wfile.write(f'data: {{"error":"{str(e)}"}}\n\n'.encode())
-            self.wfile.write(b'data: [DONE]\n\n')
-            self.wfile.flush()
+        max_rounds = 5
+        for _ in range(max_rounds):
+            headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+            if needs_auth:
+                headers["Authorization"] = f"Bearer {api_key}"
+
+            body_enc = json.dumps(body_json).encode("utf-8")
+            req = urllib.request.Request(api_url, data=body_enc, headers=headers, method="POST")
+
+            full_text = ""
+            try:
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    while True:
+                        chunk = resp.readline()
+                        if not chunk:
+                            break
+                        line = chunk.decode('utf-8', errors='replace').strip()
+                        # Swallow upstream [DONE] — we decide when to end the stream
+                        if line.startswith('data: ') and line[6:].strip() == '[DONE]':
+                            continue
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        # Buffer content for TOOL detection
+                        if line.startswith('data: '):
+                            data_str = line[6:].strip()
+                            if data_str:
+                                try:
+                                    dj = json.loads(data_str)
+                                    delta = dj.get('choices', [{}])[0].get('delta', {})
+                                    if delta.get('content'):
+                                        full_text += delta['content']
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    pass
+            except urllib.error.HTTPError as e:
+                self.wfile.write(f'data: {{"error":"HTTP {e.code}"}}\n\n'.encode())
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+                return
+            except Exception as e:
+                self.wfile.write(f'data: {{"error":"{str(e)}"}}\n\n'.encode())
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+                return
+
+            # Check for TOOL commands in accumulated response
+            match = _TOOL_PATTERN.search(full_text)
+            if not match:
+                # No more tools — stream complete, send our own [DONE]
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+                return
+
+            # Execute first tool found
+            tool_name = match.group(1)
+            tool_args_str = match.group(2) or ""
+            result = _execute_tool_from_str(tool_name, tool_args_str, api_key)
+
+            # Strip TOOL command from AI response (only text before TOOL)
+            tool_pos = full_text.find(match.group(0))
+            cleaned = full_text[:tool_pos].strip()
+
+            # Format result as XML for AI to consume
+            result_xml = _fmt_tool_result(tool_name, result)
+
+            # Build continuation messages: AI text → tool result → next AI round
+            body_json["messages"] = body_json["messages"] + [
+                {"role": "assistant", "content": cleaned if cleaned else "..."},
+                {"role": "user", "content": result_xml},
+            ]
+
+        # Max rounds exhausted — final [DONE]
+        self.wfile.write(b'data: [DONE]\n\n')
+        self.wfile.flush()
 
     def _handle_deepseek(self):
+        """Non-streaming DeepSeek proxy with P3 TOOL protocol support."""
         try:
             content_length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_length)
@@ -1533,27 +2047,67 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             body_json = json.loads(body)
             model = body_json.get("model", "")
             api_url, needs_auth = self._get_llm_url(model)
-            body = json.dumps(body_json).encode("utf-8")
+            body_json["stream"] = False
 
-            headers = {"Content-Type": "application/json", "Accept": "application/json"}
-            if needs_auth:
-                headers["Authorization"] = f"Bearer {api_key}"
+            # Inject P3 TOOL system prompt
+            _inject_tool_prompt(body_json)
 
-            req = urllib.request.Request(api_url, data=body, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                response_body = resp.read()
-                self.send_response(resp.status)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", "http://localhost:%d" % PORT))
-                self.end_headers()
-                self.wfile.write(response_body)
-        except urllib.error.HTTPError as e:
-            error_body = e.read()
-            self.send_response(e.code)
+            max_rounds = 5
+            resp_status = 200
+            resp_headers_origin = self.headers.get("Origin", f"http://localhost:{PORT}")
+            full_response = {"choices": [{"message": {"content": ""}}]}
+            has_response = False
+
+            for _ in range(max_rounds):
+                body_enc = json.dumps(body_json).encode("utf-8")
+                hdrs = {"Content-Type": "application/json", "Accept": "application/json"}
+                if needs_auth:
+                    hdrs["Authorization"] = f"Bearer {api_key}"
+
+                req = urllib.request.Request(api_url, data=body_enc, headers=hdrs, method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=120) as resp:
+                        response_body = resp.read()
+                        resp_status = resp.status
+                        has_response = True
+                except urllib.error.HTTPError as e:
+                    response_body = e.read()
+                    resp_status = e.code
+                    has_response = True
+
+                full_response = json.loads(response_body)
+                full_text = full_response.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+                match = _TOOL_PATTERN.search(full_text)
+                if not match:
+                    # No more tools — send response
+                    self.send_response(resp_status)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", resp_headers_origin)
+                    self.end_headers()
+                    self.wfile.write(json.dumps(full_response).encode("utf-8"))
+                    return
+
+                # Execute tool
+                tool_name = match.group(1)
+                tool_args_str = match.group(2) or ""
+                result = _execute_tool_from_str(tool_name, tool_args_str, api_key)
+                tool_pos = full_text.find(match.group(0))
+                cleaned = full_text[:tool_pos].strip()
+                result_xml = _fmt_tool_result(tool_name, result)
+
+                # Continuation
+                body_json["messages"] = body_json["messages"] + [
+                    {"role": "assistant", "content": cleaned if cleaned else "..."},
+                    {"role": "user", "content": result_xml},
+                ]
+
+            # Max rounds — send last response anyway
+            self.send_response(resp_status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", "http://localhost:%d" % PORT))
+            self.send_header("Access-Control-Allow-Origin", resp_headers_origin)
             self.end_headers()
-            self.wfile.write(error_body)
+            self.wfile.write(json.dumps(full_response).encode("utf-8"))
         except Exception as e:
             error = json.dumps({"error": {"message": str(e), "type": "proxy_error"}})
             self.send_response(502)
@@ -1622,8 +2176,8 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             body = self._read_body()
             raw_query = body.get("query", "")
             num = body.get("num", 8)
-            fetch_pages = body.get("fetch", 3)
-            max_chars = body.get("maxChars", 4000)
+            fetch_pages = body.get("fetch", 5)
+            max_chars = body.get("maxChars", 6000)
 
             if not raw_query:
                 self._send_json({"error": "Empty query"}, status=400)
@@ -1716,16 +2270,16 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                 _ex.shutdown(wait=False)  # Don't block on unfinished web_search
 
                 if not results:
-                    # Retry with first meaningful word (skip single chars)
-                    terms = [t for t in query.split() if len(t) >= 2]
-                    simpler = ' '.join(terms[:3]) if terms else query.split()[0] if query.split() else query
+                    # Retry: use raw_query directly (query may have lost key digits from optimize_query)
+                    simpler = raw_query.strip()
                     if len(simpler) >= 2 and simpler != query:
-                        print(f"  [RAG] retry chinese: {simpler}")
+                        print(f"  [RAG] retry raw: {simpler[:60]}")
                         results = web_search(simpler, num=num)
                     # Still nothing? Try English fallback for geopolitical/news queries
                     if not results and any(k in raw_query for k in ['战争','冲突','军事','导弹','制裁','局势','选举','总统','外交','新闻','最新','动态']):
+                        _en_terms = [t for t in raw_query.split() if len(t) >= 2]
                         _en_map = {'美国':'US','以色列':'Israel','伊朗':'Iran','俄罗斯':'Russia','乌克兰':'Ukraine','中国':'China','朝鲜':'North Korea','韩国':'South Korea','印度':'India','日本':'Japan','战争':'war','冲突':'conflict','最新':'latest','新闻':'news','军事':'military','导弹':'missile','制裁':'sanctions','局势':'situation','选举':'election'}
-                        _en_q = ' '.join([_en_map.get(t, t) for t in terms if len(t) >= 2])
+                        _en_q = ' '.join([_en_map.get(t, t) for t in _en_terms if len(t) >= 2])
                         if _en_q != ' '.join(terms) and len(_en_q) > 5:
                             print(f"  [RAG] retry english: {_en_q}")
                             results = web_search(_en_q, num=num)
@@ -1760,7 +2314,7 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             # Step 2-4: Fetch → Clean → Summarize
             contexts = []
             fetched_urls = set()
-            per_source_limit = max(200, min(800, max_chars // max(fetch_pages, 1)))
+            per_source_limit = max(200, min(1200, max_chars // max(fetch_pages, 1)))
             # Direct data sources: use snippet directly (already contains the data)
             for r in results[:fetch_pages]:
                 url = r.get("url", "")
@@ -1780,7 +2334,7 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                     if snippet and len(snippet) > 20:
                         contexts.append({"url":url,"title":r.get("title",""),"text":snippet[:per_source_limit],"length":len(snippet[:per_source_limit])})
                     continue
-                text = fetch_page_content(url, max_chars=5000)
+                text = fetch_page_content(url, max_chars=8000)
                 if text and len(text) > 100:
                     compressed = compress_context(text, raw_query, max_chars=per_source_limit)
                     if compressed:
@@ -1794,10 +2348,16 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             # Step 5: Search Re-ranking (already done in web_search)
 
             # Step 6: Context Builder
-            rag_context = ""
+            from datetime import datetime as _dt
+            _now = _dt.now()
+            _search_time = _now.strftime('%Y-%m-%d %H:%M:%S')
+            rag_context = f"""===== 时间信息 =====
+Search Time: {_search_time} UTC+8
+Current Date: {_now.strftime('%Y-%m-%d')}
+"""
             # Prepend direct lottery data
             if direct_lottery_text:
-                rag_context += direct_lottery_text + "\n\n"
+                rag_context += "\n" + direct_lottery_text + "\n\n"
             summaries = []
             for ctx in contexts:
                 s = None
@@ -1872,6 +2432,33 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._send_json(result)
 
         except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+
+    def _handle_tool(self):
+        """Execute local agent tool (file operations / whitelist shell)."""
+        try:
+            body = self._read_body()
+            tool = body.get("tool", "")
+            params = body.get("params", {})
+            action_type = body.get("type", "file")  # "file" or "shell"
+
+            if action_type == "shell":
+                api_key = self.headers.get("X-API-Key", "")
+                if not api_key:
+                    self._send_json({"ok": False, "error": "API key required for shell commands"}, status=401)
+                    return
+                command = params.get("command", "")
+                timeout = params.get("timeout", 30)
+                workdir = params.get("workdir", None)
+                result = _run_shell_cmd(command, timeout, workdir)
+            else:
+                result = _run_file_tool(tool, params)
+
+            self._send_json(result)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             self._send_json({"error": str(e)}, status=500)
 
     def _handle_classify(self):
@@ -2010,14 +2597,18 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                 self._send_json({"ok": True})
             elif path == "/api/db/tasks":
                 tid = params.get("id")
-                if tid is None or tid <= 0:
+                if tid is None:
                     self._send_json({"error": "Missing id"}, status=400)
                     return
                 try:
-                    db.delete_task(int(tid))
-                except ValueError:
+                    tid = int(tid)
+                    if tid <= 0:
+                        self._send_json({"error": "Invalid id"}, status=400)
+                        return
+                except (TypeError, ValueError):
                     self._send_json({"error": "Invalid id"}, status=400)
                     return
+                db.delete_task(tid)
                 self._send_json({"ok": True})
             elif path == "/api/db/memories":
                 mid = params.get("id")
@@ -2045,18 +2636,28 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         try:
             body = self._read_body()
             if path == "/api/db/tasks":
-                tid = body.get("id") if body.get("id") is not None else (int(self._parse_qs().get("id")) if self._parse_qs().get("id") else None)
-                if tid is None or tid <= 0:
+                tid = body.get("id")
+                if tid is None:
+                    try:
+                        tid = int(self._parse_qs().get("id")) if self._parse_qs().get("id") else None
+                    except (TypeError, ValueError):
+                        tid = None
+                if tid is None or (isinstance(tid, int) and tid <= 0):
                     self._send_json({"error": "Missing id"}, status=400)
                     return
-                db.update_task(tid, body)
+                db.update_task(int(tid), body)
                 self._send_json({"ok": True})
             elif path == "/api/db/memories":
-                mid = body.get("id") if body.get("id") is not None else (int(self._parse_qs().get("id")) if self._parse_qs().get("id") else None)
-                if mid is None or mid <= 0:
+                mid = body.get("id")
+                if mid is None:
+                    try:
+                        mid = int(self._parse_qs().get("id")) if self._parse_qs().get("id") else None
+                    except (TypeError, ValueError):
+                        mid = None
+                if mid is None or (isinstance(mid, int) and mid <= 0):
                     self._send_json({"error": "Missing id"}, status=400)
                     return
-                db.update_memory(mid, body)
+                db.update_memory(int(mid), body)
                 self._send_json({"ok": True})
             else:
                 self.send_error(404)
