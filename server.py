@@ -2517,19 +2517,24 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._send_json({"ok": False, "error": "action 须为 create/stop/list"})
 
     def _handle_auto_install(self):
-        """POST /api/auto/install — install or uninstall pyautogui + pillow."""
+        """POST /api/auto/install — install or uninstall pyautogui + pillow.
+        Prefers local runtime/auto-deps/ .whl files for offline install."""
         if not self._require_auto_token(): return
         body = self._read_body()
-        action = body.get("action", "")  # "install" | "uninstall"
+        action = body.get("action", "")
         if action == "install":
             try:
-                import subprocess
-                r = subprocess.run([sys.executable, "-m", "pip", "install", "pyautogui", "pillow", "--quiet"],
-                                   capture_output=True, text=True, timeout=120)
-                if r.returncode == 0:
-                    self._send_json({"ok": True, "message": "安装成功"})
+                import subprocess, glob
+                auto_dir = os.path.join(SCRIPT_DIR, "runtime", "auto-deps")
+                whls = glob.glob(os.path.join(auto_dir, "*.whl")) if os.path.isdir(auto_dir) else []
+                if whls:
+                    cmd = [sys.executable, "-m", "pip", "install"] + whls + ["--quiet"]
                 else:
-                    self._send_json({"ok": False, "error": r.stderr[:200]})
+                    cmd = [sys.executable, "-m", "pip", "install", "pyautogui", "pillow", "--quiet"]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                self._send_json({"ok": r.returncode == 0,
+                                 "message": "安装成功" if r.returncode == 0 else r.stderr[:200],
+                                 "source": "local" if whls else "online"})
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)[:200]})
         elif action == "uninstall":
