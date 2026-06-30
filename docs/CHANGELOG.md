@@ -1,5 +1,25 @@
 # USB-AI 变更日志
 
+## v4.5.7（2026-06-30）
+
+### 修复：AI TOOL 调用格式
+- `_TOOL_SYSTEM_PROMPT` 去掉 XML `<tool>` 标签 → 改为 markdown 列表格式，避免 DeepSeek 输出 `<tool_call>` 而非 `[TOOL:]`
+- System prompt 增加 Windows 11 环境声明 + 桌面自动化铁律，防止 AI 角色扮演 Ubuntu
+
+### 修复：LOCAL_TOKEN 持久化
+- `data/local_token.txt` 持久化 token，重启不变，解决设置面板红叉问题
+- `_inject_token()` 改用 regex 匹配已有 token，而非只替换空占位符
+
+### 修复：pip install ProxyError
+- `_handle_auto_install()` 清除 Windows 系统代理环境变量（HTTP_PROXY/HTTPS_PROXY）
+
+### 新增：目录结构升级（v5 升级计划 ①⑥）
+- 创建 `runtime/python-win/`、`runtime/python-mac/`、`runtime/llama/`、`tasks/`、`screenshots/`
+- `setup_auto.bat` / `setup_auto.sh`：桌面自动化依赖一键安装脚本，支持离线 whl 优先
+- `.gitignore` 更新：新增 `*.bak`、`runtime/python-win/` 等规则
+
+---
+
 ## v4.5.6（2026-06-29）
 
 ### 新增：桌面自动化代理（pyautogui）

@@ -4,3 +4,7 @@ __pycache__/
 data/
 *.gguf
 runtime/models/*.gguf
+runtime/python-win/
+runtime/python-mac/
+runtime/llama/
+*.bak
