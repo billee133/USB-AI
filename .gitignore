@@ -3,8 +3,34 @@
 __pycache__/
 data/
 *.gguf
-runtime/models/*.gguf
-runtime/python-win/
-runtime/python-mac/
-runtime/llama/
+runtime/
 *.bak
+*.log
+
+# User runtime data
+data.db
+workspace/
+screenshots/
+tasks/
+
+# Agent & config files
+.agents/
+.claude/
+CONTEXT.md
+skills-lock.json
+
+# Docs (only publish user-facing docs)
+docs/agents/
+docs/CHANGELOG.md
+docs/CLAUDE.md
+docs/ERROR_LOG.md
+docs/Learning.md
+docs/Memory.md
+docs/README.txt
+docs/Wiki.md
+docs/招商方案.md
+
+# Setup scripts
+setup_searxng.bat
+setup_searxng.py
+static/vendor/

@@ -1,6 +1,6 @@
-# 本地 Agent 工具设计 v2.0
+# 本地 Agent 工具设计 v2.1
 
-> **实现状态**: P1 ✅ 文件工具 | P2 ✅ 白名单 Shell | P3 ✅ TOOL 协议
+> **实现状态**: P1 ✅ 文件工具 | P2 ✅ 白名单 Shell | P3 ✅ TOOL 协议（含截图强制 save_path）
 
 ## 概述
 
@@ -19,8 +19,8 @@
 | 工具名 | 方法 | 参数 | 说明 |
 |--------|------|------|------|
 | `read_file` | file_read | path | 读文件，按行返回 |
-| `write_file` | file_write | path, content | 写文件（覆盖） |
-| `append_file` | file_append | path, content | 追加写入 |
+| `write_file` | file_write | path, content | 写文件（覆盖），\n 自动转义 |
+| `append_file` | file_append | path, content | 追加写入，\n 自动转义 |
 | `list_directory` | file_ls | path | 列出目录内容 |
 | `create_directory` | file_mkdir | path | 创建目录 |
 | `move_file` | file_mv | src, dst | 移动/重命名 |
@@ -236,24 +236,32 @@ TOOL_PATTERN = re.compile(r'\[TOOL:(\w+)\s+([^\]]*)\]')
 
 ### System Prompt 注入
 
-在发送给 AI 的 system prompt 末尾追加：
+在发送给 AI 的 system prompt 末尾追加（当前 v4.5.9 版本）：
 
 ```
 ## 本地工具调用
 
-你可以调用以下工具操作本地电脑：
+你可以使用以下工具操作本地电脑。工具会在你输出调用指令后自动执行，结果会注入对话。
 
-<tool name="read_file" args="path">读取文件内容。path 必须在 workspace/ data/ uploads/ 目录内。</tool>
-<tool name="write_file" args="path, content">写入文件。覆盖已存在文件。</tool>
-<tool name="run_command" args="command">执行白名单 Shell 命令（git/python/pip/npm/ls/cat/echo 等）。</tool>
-<tool name="list_directory" args="path">列出目录内容。</tool>
+read_file(path): 读取文件内容。
+write_file(path, content): 写入文件，覆盖已存在文件。
+run_command(command): 在沙箱中执行 Shell 命令。仅白名单命令可用。
+list_directory(path): 列出目录内容。
+screenshot(save_path): 截取屏幕截图。save_path 必传！指定保存路径为桌面目录。
+click(x, y, button, clicks): 模拟鼠标点击。
+type_text(text, interval): 键盘输入。
+hotkey(keys): 发送键盘快捷键。
+browser_open(url, newTab): 在默认浏览器中打开指定 URL。
 
 调用格式：
-[TOOL:read_file path="main.py"]
+[TOOL:read_file path="data/example.txt"]
 [TOOL:run_command command="git status"]
+[TOOL:screenshot save_path="C:\\Users\\iobcn\\Desktop\\"]
 
 工具结果会自动注入对话，无需重复请求。
 ```
+
+> ⚠️ v4.5.9 截图铁律：`[TOOL:screenshot {}]` 空参数已从 Prompt 删除。`save_path` 必传。
 
 ### 与 SSE 流的整合
 
@@ -269,6 +277,18 @@ AI Proxy → 检测 TOOL 模式 → 中断 SSE → 执行工具 → 本地调用
 - 每轮 AI 输出的 `[TOOL:]` 文本被客户端 `_cleanToolMarkers()` 移除
 - `<tool_result>` XML 标记注入到下一轮请求的 messages 中，不由前端显示
 - 最多 5 轮自动续推理，超限后强制返回
+
+### 截图工具特殊处理（v4.5.9）
+
+截图工具 `screenshot(save_path)` 有两条返回路径：
+
+1. **带 `save_path`**（推荐）：文件直接存盘 → 返回 `{ok, saved, size, file_size_kb}` → AI 收到 `<saved>` 标签
+2. **不带 `save_path`**（v4.5.9 已禁止）：返回 base64 → `_fmt_tool_result` 返回 `<error>文件未保存！...</error>` → AI 必须重试
+
+`_fmt_tool_result` 强约束：
+- 有 `saved` → 正常返回路径
+- 有 `image_b64` 无 `saved` → 强制错误，禁止 AI 说"截图已保存"
+- 只有 `error` → AI 应报告错误原因
 
 ### 安全配置
 
@@ -313,6 +333,7 @@ TOOL_CONFIG = {
 ✅ 文件大小保护：read 上限 1MB
 ✅ 全日志：data/tool_log.jsonl 记录每次调用
 ✅ P3 TOOL 协议：SSE 流拦截 + 自动执行 + 续推理（最多 5 轮）
+✅ write_file/append_file 转义：`_unescape_content()` 占位符法 — `\n`→换行 `\t`→制表 `\"`→引号 `\\`→反斜杠
 ```
 
 ## 禁止清单（硬性规则）

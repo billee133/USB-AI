@@ -2,12 +2,13 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<link rel="icon" href="favicon.ico" type="image/x-icon">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>USB-AI v4</title>
-<link rel="stylesheet" href="style.css?v=14">
+<link rel="stylesheet" href="style.css?v=31">
 <script>
-(function(){var l='/static/vendor/katex.min.css',c='https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css';var e=document.createElement('link');e.rel='stylesheet';e.href=l;e.onerror=function(){var f=document.createElement('link');f.rel='stylesheet';f.href=c;document.head.appendChild(f)};document.head.appendChild(e)})();
-(function(){var l='/static/vendor/github.min.css',c='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css';var e=document.createElement('link');e.rel='stylesheet';e.href=l;e.id='hl-theme';e.setAttribute('data-fallback',c);document.head.appendChild(e)})();
+(function(){var e=document.createElement('link');e.rel='stylesheet';e.href='https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css';e.onerror=function(){var f=document.createElement('link');f.rel='stylesheet';f.href='/static/vendor/katex.min.css';document.head.appendChild(f)};document.head.appendChild(e)})();
+(function(){var l='/static/vendor/github-dark.min.css',c='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css';var e=document.createElement('link');e.rel='stylesheet';e.href=l;e.onerror=function(){var f=document.createElement('link');f.rel='stylesheet';f.href=c;document.head.appendChild(f)};document.head.appendChild(e)})();
 </script>
 </head>
 <body class="light">
@@ -17,28 +18,74 @@
   <button class="c" id="c-think" onclick="tglThink()">🧠 <span class="tt">深度思考</span></button>
   <button class="c" id="c-search" onclick="tglSearch()">🌐 <span class="tt">联网搜索</span></button>
   <span class="spacer"></span>
-  <button class="btn" onclick="tglTheme()">☀</button>
   <button class="btn" onclick="openSet()">⚙</button>
   <button class="btn" onclick="clrChat()">🗑</button>
 </div>
 <div id="modal" onclick="if(event.target===this)closeSet()">
   <div id="modal-box">
-    <h3 style="font-size:16px;margin-bottom:14px;color:var(--txe)">⚙ 设置</h3>
-    <input type="password" id="apikey" placeholder="sk-...">
-    <select id="model">
-      <option value="deepseek-v4-pro">V4 Pro</option>
-      <option value="deepseek-v4-flash">V4 Flash</option>
-      <option value="deepseek-chat">V3</option>
-      <option value="deepseek-reasoner">R1</option>
-      <optgroup label="Ollama 本地">
-        <option value="deepseek-r1:1.5b">R1 1.5B</option>
-        <option value="qwen2.5:0.5b">Qwen 0.5B</option>
-      </optgroup>
-      <optgroup id="local-llm-group" label="llama-cpp 本地"></optgroup>
-    </select>
-    <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--txt);margin-bottom:4px;cursor:pointer"><input type="checkbox" id="debug-toggle" onchange="toggleDebug()"> 显示调试日志</label>
-    <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--txt);margin-bottom:10px;cursor:pointer"><input type="checkbox" id="auto-toggle" onchange="toggleAuto()"> 🤖 桌面自动化 <span id="auto-status" style="font-size:10px;color:var(--txd)">检测中...</span></label>
-    <div class="acts"><button onclick="closeSet()">取消</button><button class="pri" onclick="saveSet()">保存</button></div>
+    <div class="mh">
+      <span class="mh-icon">⚙</span>
+      <span class="mh-title">设置</span>
+      <button class="mh-close" onclick="closeSet()">✕</button>
+    </div>
+
+    <div class="ms">
+      <div class="ms-hd">🔑 API 密钥</div>
+      <div class="ms-body">
+        <input type="password" id="apikey" class="ms-input" placeholder="sk-..." autocomplete="off">
+        <div class="ms-hint">在 <a href="https://platform.deepseek.com" target="_blank">platform.deepseek.com</a> 获取</div>
+      </div>
+    </div>
+
+    <div class="ms">
+      <div class="ms-hd">🧠 模型</div>
+      <div class="ms-body">
+        <select id="model" class="ms-input">
+          <option value="deepseek-v4-pro">V4 Pro · 最强推理</option>
+          <option value="deepseek-v4-flash">V4 Flash · 极速低成本</option>
+          <option value="deepseek-chat">V3 · 日常对话</option>
+          <option value="deepseek-reasoner">R1 · 推理链展示</option>
+          <optgroup label="Ollama 本地">
+            <option value="deepseek-r1:1.5b">R1 1.5B</option>
+            <option value="qwen2.5:0.5b">Qwen 0.5B</option>
+          </optgroup>
+          <optgroup id="local-llm-group" label="llama-cpp 本地"></optgroup>
+        </select>
+      </div>
+    </div>
+
+    <div class="ms">
+      <div class="ms-hd">⚡ 功能开关</div>
+      <div class="ms-body">
+        <label class="ms-row">
+          <span class="ms-row-left">
+            <span class="ms-row-icon">📋</span>
+            <span class="ms-row-label">调试日志</span>
+            <span class="ms-row-desc">在侧边栏显示请求详情</span>
+          </span>
+          <span class="ms-tgl">
+            <input type="checkbox" id="debug-toggle" onchange="toggleDebug()">
+            <span class="ms-tgl-knob"></span>
+          </span>
+        </label>
+        <label class="ms-row" id="auto-row">
+          <span class="ms-row-left">
+            <span class="ms-row-icon">🤖</span>
+            <span class="ms-row-label">桌面自动化</span>
+            <span id="auto-status" class="ms-row-desc">检测中...</span>
+          </span>
+          <span class="ms-tgl">
+            <input type="checkbox" id="auto-toggle" onchange="toggleAuto()">
+            <span class="ms-tgl-knob"></span>
+          </span>
+        </label>
+      </div>
+    </div>
+
+    <div class="acts">
+      <button class="acts-cancel" onclick="closeSet()">取消</button>
+      <button class="acts-save" onclick="saveSet()">保存设置</button>
+    </div>
   </div>
 </div>
 <div id="layout">
@@ -51,15 +98,23 @@
     </div>
   </div>
   <div id="main">
-    <div id="welcome"><div class="w-title">今天需要什么帮助？</div><div class="w-desc">DeepSeek V4 · 联网搜索 · /search 搜网页</div><textarea id="winput" placeholder="输入消息…" rows="1"></textarea><button onclick="sendW()" id="wsend">发送</button></div>
+    <div id="welcome"><div class="w-title">今天需要什么帮助？</div><div class="w-desc">DeepSeek V4 · 联网搜索 · /search 搜网页</div><div style="display:flex;gap:6px;align-items:center"><textarea id="winput" placeholder="输入消息…" rows="1"></textarea><input type="file" id="wfile-input" style="display:none" multiple onchange="handleFiles(this)"><button class="btn" onclick="document.getElementById('wfile-input').click()" title="上传文件" style="font-size:18px;padding:8px 10px;min-height:52px;display:flex;align-items:center;border-radius:12px">📎</button></div><button onclick="sendW()" id="wsend">发送</button></div>
     <div id="chat"></div>
     <div id="status"><span id="model-badge"></span><span id="status-text">就绪 · 点 ⚙ 配置 API Key</span></div>
-    <div id="input-wrap"><textarea id="input" placeholder="输入消息…" rows="1"></textarea><button id="send" onclick="send()">发送</button></div>
+    <div id="file-bar" style="display:none"></div>
+    <div id="input-wrap"><input type="file" id="file-input" style="display:none" multiple onchange="handleFiles(this)"><button id="attach-btn" class="btn" onclick="document.getElementById('file-input').click()" title="上传文件" style="font-size:17px">📎</button><textarea id="input" placeholder="输入消息…" rows="1"></textarea><button id="send" onclick="send()">发送</button></div>
+  </div>
+  <div id="preview" style="display:none">
+    <div class="preview-header">
+      <span id="preview-label">预览</span>
+      <button class="btn" onclick="closePreview()" style="font-size:16px;padding:2px 10px;line-height:1">✕</button>
+    </div>
+    <div id="preview-content"></div>
   </div>
 </div>
-<script>let LOCAL_TOKEN = 'd787195c803d75f905fc8c843dd93b25';</script>
+<script>let LOCAL_TOKEN = '2aa2d2d606d0f91395f75e0987ed7adc';</script>
 <script src="conversation-manager.js?v=14"></script>
-<script src="app.js?v=14"></script>
+<script src="app.js?v=48"></script>
 <script>
 (function(){['marked.min.js','katex.min.js','highlight.min.js'].forEach(function(n){var l='/static/vendor/'+n,cdns={'marked.min.js':'https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js','katex.min.js':'https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js','highlight.min.js':'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js'};var s=document.createElement('script');s.src=l;s.onerror=function(){var f=document.createElement('script');f.src=cdns[n];document.body.appendChild(f)};document.body.appendChild(s)})})();
 // Populate local LLM models from server

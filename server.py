@@ -32,9 +32,13 @@ except ImportError:
 PORT = 8082
 
 # ============ Engine Health Tracker ============
-_ENGINE_FAILS = {'DDG': 0, 'Bing': 0, 'Sogou': 0}
+_ENGINE_FAILS = {'DDG': 0, 'Bing': 0, 'Sogou': 0, 'SearXNG': 0}
 _ENGINE_FAIL_THRESHOLD = 3
 _ENGINE_LOCK = threading.Lock()
+
+# SearXNG self-hosted search config
+_SEARXNG_URL = "http://127.0.0.1:8888"  # Default SearXNG for Windows port
+_SEARXNG_TIMEOUT = 8
 
 def _engine_ok(name):
     with _ENGINE_LOCK:
@@ -261,6 +265,58 @@ class Database:
             )
             conn.commit()
             conn.close()
+
+    # --- Entity Memory ---
+    def _ensure_entities_table(self, conn):
+        """Lazily create entities table for long-term user memory."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT,
+                entity_value TEXT,
+                context TEXT,
+                weight REAL DEFAULT 1.0,
+                created_at TEXT DEFAULT (datetime('now')),
+                last_seen_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type)")
+
+    def upsert_entity(self, entity_type, entity_value, context=""):
+        """Insert or refresh an entity's last_seen_at (boosts recency weight)."""
+        with self._lock:
+            conn = self._connect()
+            self._ensure_entities_table(conn)
+            existing = conn.execute(
+                "SELECT id FROM entities WHERE entity_type=? AND entity_value=?",
+                (entity_type, entity_value)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE entities SET last_seen_at=datetime('now'), weight=weight+0.2, context=? WHERE id=?",
+                    (context[:200], existing[0])
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO entities (entity_type, entity_value, context) VALUES (?,?,?)",
+                    (entity_type, entity_value, context[:200])
+                )
+            conn.commit()
+            conn.close()
+
+    def get_top_entities(self, limit=8):
+        """Return entities ranked by recency-decayed weight."""
+        with self._lock:
+            conn = self._connect()
+            self._ensure_entities_table(conn)
+            rows = conn.execute("""
+                SELECT entity_type, entity_value, context,
+                       weight * (1.0 / (1.0 + (julianday('now') - julianday(last_seen_at)) * 0.1)) AS score
+                FROM entities
+                ORDER BY score DESC LIMIT ?
+            """, (limit,)).fetchall()
+            conn.close()
+            return [{"type": r[0], "value": r[1], "context": r[2]} for r in rows]
 
     def delete_task(self, tid):
         with self._lock:
@@ -588,6 +644,36 @@ def _sogou_search(query, num=5):
         if results: _engine_success("Sogou")
     return results
 
+
+def _searxng_search(query, num=5):
+    """Search via local SearXNG instance (self-hosted, privacy-respecting).
+    Falls back silently if SearXNG is not running.
+    """
+    results = []
+    if not _engine_ok("SearXNG"):
+        return results
+    try:
+        url = f"{_SEARXNG_URL}/search?q={urllib.parse.quote(query)}&format=json&language=zh-CN&categories=general&pageno=1"
+        req = urllib.request.Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=_SEARXNG_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        for item in data.get("results", [])[:num]:
+            title = item.get("title", "")
+            url = item.get("url", "")
+            snippet = item.get("content", "")
+            if title or snippet:
+                results.append({"title": title, "url": url, "snippet": snippet, "engine": "SearXNG"})
+        if results:
+            _engine_success("SearXNG")
+    except (urllib.error.HTTPError, urllib.error.URLError, ConnectionRefusedError, ConnectionError) as e:
+        _engine_fail("SearXNG")
+        log_error("search", "SearXNG", f"{type(e).__name__}: {str(e)[:100]}")
+    except Exception as e:
+        _engine_fail("SearXNG")
+        log_error("search", "SearXNG", str(e)[:200])
+    return results
+
+
 # ============ Chinese Tokenizer ============
 try:
     import jieba
@@ -633,6 +719,64 @@ _STRIP_WORDS = {
 }
 # NOTE: '安装','配置','设置','部署','下载','编译','运行','启动','连接','登录'
 # are technical verbs — NEVER add them to strip list.
+
+def generate_hyde_query(user_message, api_key, timeout=8):
+    """Generate a hypothetical answer to use as the search query (HyDE technique).
+    Falls back to the original message on any failure — never blocks the pipeline."""
+    if not api_key or len(user_message) < 6:
+        return user_message
+    prompt = (
+        f"针对这个问题，写一段50字以内的假设性回答（即使你不确定也要写出最可能的答案，"
+        f"措辞要像新闻或百科文章）：{user_message}\n只返回这段假设性回答，不要任何前缀或解释。"
+    )
+    try:
+        body = json.dumps({
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 100, "temperature": 0.3
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.deepseek.com/v1/chat/completions",
+            data=body, method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        hyde_text = data["choices"][0]["message"]["content"].strip()
+        return hyde_text if hyde_text else user_message
+    except Exception as e:
+        print(f"  [HyDE] {e}", file=sys.stderr)
+        return user_message
+
+
+def generate_stepback_query(user_message, api_key, timeout=6):
+    """Generate a more general/abstract version of a specific question (Step-Back Prompting).
+    e.g. '特朗普对华关税最新进展' -> '美中贸易关系'. Returns None if not applicable."""
+    if not api_key or len(user_message) < 15:
+        return None
+    prompt = (
+        f"如果这个问题太具体，写一个更宏观、更通用的版本（5-10字，用于辅助搜索背景信息）："
+        f"{user_message}\n如果问题已经足够通用就返回\"无\"。只返回结果，不要解释。"
+    )
+    try:
+        body = json.dumps({
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 30, "temperature": 0.2
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.deepseek.com/v1/chat/completions",
+            data=body, method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        result = data["choices"][0]["message"]["content"].strip()
+        return None if (not result or "无" in result[:3]) else result
+    except Exception as e:
+        print(f"  [StepBack] {e}", file=sys.stderr)
+        return None
+
 
 def optimize_query(user_message, search_context=""):
     """
@@ -1086,14 +1230,624 @@ def search_forex(query):
     return results
 
 
+# ============ 新增信息源 ============
+
+def search_hacker_news(query):
+    """Hacker News via Algolia API — 技术资讯，CORS开放，免费无key。"""
+    results = []
+    try:
+        params = urllib.parse.urlencode({
+            "query": query, "tags": "story",
+            "hitsPerPage": 5
+        })
+        url = f"https://hn.algolia.com/api/v1/search?{params}"
+        data = json.loads(_fetch(url, timeout=8))
+        for hit in data.get("hits", [])[:5]:
+            title = hit.get("title", "")
+            story_url = hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID','')}"
+            pts = hit.get("points", 0)
+            comments = hit.get("num_comments", 0)
+            age = hit.get("created_at", "")[:10]
+            results.append({
+                "title": title,
+                "url": story_url,
+                "snippet": f"[HN] {pts}分 {comments}评 {age}",
+                "engine": "HackerNews"
+            })
+    except Exception as e:
+        print(f"  [HN] {e}", file=sys.stderr)
+    return results
+
+
+def search_arxiv(query, max_results=4):
+    """arXiv API — 学术预印本，物理/数学/CS/AI，免费无key。"""
+    results = []
+    try:
+        params = urllib.parse.urlencode({
+            "search_query": f"all:{query}",
+            "max_results": max_results,
+            "sortBy": "relevance",
+            "sortOrder": "descending"
+        })
+        url = f"http://export.arxiv.org/api/query?{params}"
+        xml = _fetch(url, timeout=10)
+        # Parse entries with regex (no xml lib needed)
+        entries = re.findall(r'<entry>(.*?)</entry>', xml, re.DOTALL)
+        for entry in entries[:max_results]:
+            title_m = re.search(r'<title>(.*?)</title>', entry, re.DOTALL)
+            summary_m = re.search(r'<summary>(.*?)</summary>', entry, re.DOTALL)
+            link_m = re.search(r'<id>(.*?)</id>', entry)
+            published_m = re.search(r'<published>(.*?)</published>', entry)
+            if title_m and link_m:
+                title = re.sub(r'\s+', ' ', title_m.group(1)).strip()
+                summary = re.sub(r'\s+', ' ', summary_m.group(1)).strip()[:200] if summary_m else ""
+                link = link_m.group(1).strip()
+                pub = published_m.group(1)[:10] if published_m else ""
+                results.append({
+                    "title": f"[arXiv] {title}",
+                    "url": link.replace("http://", "https://"),
+                    "snippet": f"{pub} — {summary}",
+                    "engine": "arXiv"
+                })
+    except Exception as e:
+        print(f"  [arXiv] {e}", file=sys.stderr)
+    return results
+
+
+def search_pubmed(query, max_results=4):
+    """PubMed E-utilities — 生物医学文献，免费无key，1100万篇。"""
+    results = []
+    try:
+        # Step 1: search for IDs
+        params = urllib.parse.urlencode({
+            "db": "pubmed", "term": query,
+            "retmax": max_results, "retmode": "json", "sort": "relevance"
+        })
+        data = json.loads(_fetch(f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?{params}", timeout=8))
+        ids = data.get("esearchresult", {}).get("idlist", [])[:max_results]
+        if not ids:
+            return results
+        # Step 2: fetch summaries
+        sum_params = urllib.parse.urlencode({
+            "db": "pubmed", "id": ",".join(ids), "retmode": "json"
+        })
+        sum_data = json.loads(_fetch(f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?{sum_params}", timeout=8))
+        for pid in ids:
+            art = sum_data.get("result", {}).get(pid, {})
+            title = art.get("title", "")
+            pub_date = art.get("pubdate", "")[:7]
+            authors = ", ".join([a.get("name","") for a in art.get("authors", [])[:2]])
+            if title:
+                results.append({
+                    "title": f"[PubMed] {title}",
+                    "url": f"https://pubmed.ncbi.nlm.nih.gov/{pid}/",
+                    "snippet": f"{pub_date} {authors}",
+                    "engine": "PubMed"
+                })
+    except Exception as e:
+        print(f"  [PubMed] {e}", file=sys.stderr)
+    return results
+
+
+def search_semantic_scholar(query, max_results=4):
+    """Semantic Scholar API — AI驱动学术搜索，免费无key，引用关系。"""
+    results = []
+    try:
+        params = urllib.parse.urlencode({
+            "query": query, "limit": max_results,
+            "fields": "title,year,abstract,url,citationCount,authors"
+        })
+        url = f"https://api.semanticscholar.org/graph/v1/paper/search?{params}"
+        data = json.loads(_fetch(url, timeout=10))
+        for paper in data.get("data", [])[:max_results]:
+            title = paper.get("title", "")
+            year = paper.get("year", "")
+            citations = paper.get("citationCount", 0)
+            abstract = (paper.get("abstract") or "")[:150]
+            authors = ", ".join([a.get("name","") for a in paper.get("authors",[])[:2]])
+            paper_url = paper.get("url") or f"https://www.semanticscholar.org/paper/{paper.get('paperId','')}"
+            if title:
+                results.append({
+                    "title": f"[Scholar] {title}",
+                    "url": paper_url,
+                    "snippet": f"{year} {authors} — 被引{citations}次 — {abstract}",
+                    "engine": "SemanticScholar"
+                })
+    except Exception as e:
+        print(f"  [SemanticScholar] {e}", file=sys.stderr)
+    return results
+
+
+def search_github(query, max_results=5):
+    """GitHub Search API — 代码/仓库搜索，无token 60次/h，有token 5000次/h。"""
+    results = []
+    try:
+        # Search repositories
+        params = urllib.parse.urlencode({
+            "q": query, "sort": "stars", "order": "desc", "per_page": max_results
+        })
+        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+        req = urllib.request.Request(
+            f"https://api.github.com/search/repositories?{params}", headers=headers
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode())
+        for repo in data.get("items", [])[:max_results]:
+            name = repo.get("full_name", "")
+            desc = repo.get("description") or ""
+            stars = repo.get("stargazers_count", 0)
+            lang = repo.get("language") or ""
+            updated = (repo.get("updated_at") or "")[:10]
+            results.append({
+                "title": f"[GitHub] {name}",
+                "url": repo.get("html_url", ""),
+                "snippet": f"⭐{stars:,} {lang} {updated} — {desc[:100]}",
+                "engine": "GitHub"
+            })
+    except Exception as e:
+        print(f"  [GitHub] {e}", file=sys.stderr)
+    return results
+
+
+def search_stackoverflow(query, max_results=4):
+    """Stack Overflow API — 编程问答，免费，CORS开放。"""
+    results = []
+    try:
+        params = urllib.parse.urlencode({
+            "intitle": query, "order": "desc", "sort": "votes",
+            "site": "stackoverflow", "filter": "withbody",
+            "pagesize": max_results
+        })
+        url = f"https://api.stackexchange.com/2.3/questions?{params}"
+        data = json.loads(_fetch(url, timeout=8))
+        for q in data.get("items", [])[:max_results]:
+            title = q.get("title", "")
+            link = q.get("link", "")
+            score = q.get("score", 0)
+            answers = q.get("answer_count", 0)
+            tags = " ".join(q.get("tags", [])[:3])
+            results.append({
+                "title": f"[SO] {title}",
+                "url": link,
+                "snippet": f"↑{score} {answers}答 [{tags}]",
+                "engine": "StackOverflow"
+            })
+    except Exception as e:
+        print(f"  [SO] {e}", file=sys.stderr)
+    return results
+
+
+def search_npm(package_name):
+    """npm Registry — 包信息/版本/下载量，免费无key，CORS开放。"""
+    results = []
+    try:
+        # Search
+        search_url = f"https://registry.npmjs.org/-/v1/search?text={urllib.parse.quote(package_name)}&size=3"
+        data = json.loads(_fetch(search_url, timeout=8))
+        for obj in data.get("objects", [])[:3]:
+            p = obj.get("package", {})
+            name = p.get("name", "")
+            ver = p.get("version", "")
+            desc = p.get("description", "")
+            dl = obj.get("score", {}).get("detail", {}).get("popularity", 0)
+            results.append({
+                "title": f"[npm] {name} v{ver}",
+                "url": f"https://www.npmjs.com/package/{name}",
+                "snippet": desc[:150],
+                "engine": "npm"
+            })
+    except Exception as e:
+        print(f"  [npm] {e}", file=sys.stderr)
+    return results
+
+
+def search_pypi(package_name):
+    """PyPI API — Python包信息，免费无key，CORS开放。"""
+    results = []
+    try:
+        # Try direct package lookup first
+        pkg = re.sub(r'[^\w\-]', '-', package_name.strip().split()[0])
+        url = f"https://pypi.org/pypi/{pkg}/json"
+        data = json.loads(_fetch(url, timeout=8))
+        info = data.get("info", {})
+        name = info.get("name", pkg)
+        ver = info.get("version", "")
+        desc = info.get("summary", "")
+        author = info.get("author", "")
+        license_ = info.get("license", "")
+        results.append({
+            "title": f"[PyPI] {name} {ver}",
+            "url": f"https://pypi.org/project/{name}/",
+            "snippet": f"{desc} | 作者:{author} | 协议:{license_}",
+            "engine": "PyPI"
+        })
+    except Exception as e:
+        print(f"  [PyPI] {e}", file=sys.stderr)
+    return results
+
+
+def search_bilibili_hot():
+    """B站热门排行 — CORS部分开放，实时中文娱乐/科技趋势，无key。"""
+    results = []
+    try:
+        url = "https://api.bilibili.com/x/web-interface/ranking/v2?rid=0&type=all"
+        data = json.loads(_fetch(url, timeout=8))
+        for video in (data.get("data", {}).get("list") or [])[:6]:
+            title = video.get("title", "")
+            author = video.get("owner", {}).get("name", "")
+            views = video.get("stat", {}).get("view", 0)
+            bvid = video.get("bvid", "")
+            desc = video.get("desc", "")[:80]
+            results.append({
+                "title": f"[B站] {title}",
+                "url": f"https://www.bilibili.com/video/{bvid}",
+                "snippet": f"UP:{author} 播放:{views:,} — {desc}",
+                "engine": "Bilibili"
+            })
+    except Exception as e:
+        print(f"  [Bilibili] {e}", file=sys.stderr)
+    return results
+
+
+def search_weibo_hot():
+    """微博热搜 — 实时社会热点，需代理，返回Top20热搜词+热度。"""
+    results = []
+    try:
+        url = "https://weibo.com/ajax/side/hotSearch"
+        html = _fetch(url, timeout=8, extra_headers={
+            "Referer": "https://weibo.com/",
+            "Accept": "application/json, text/plain, */*"
+        })
+        data = json.loads(html)
+        realtime = data.get("data", {}).get("realtime", [])[:10]
+        for item in realtime:
+            word = item.get("word", "")
+            hot = item.get("raw_hot", 0)
+            category = item.get("category", "")
+            if word:
+                results.append({
+                    "title": f"[微博热搜] {word}",
+                    "url": f"https://s.weibo.com/weibo?q=%23{urllib.parse.quote(word)}%23",
+                    "snippet": f"热度:{hot:,} 分类:{category}",
+                    "engine": "WeiboHot"
+                })
+    except Exception as e:
+        print(f"  [Weibo] {e}", file=sys.stderr)
+    return results
+
+
+def search_zhihu_hot():
+    """知乎热榜 — 话题/问题热点，代理抓取。"""
+    results = []
+    try:
+        url = "https://www.zhihu.com/hot"
+        html = _fetch(url, timeout=10, extra_headers={
+            "Referer": "https://www.zhihu.com/"
+        })
+        # Extract hot items from JSON embedded in page
+        json_match = re.search(r'"hotList":\s*(\[.*?\])\s*,\s*"', html, re.DOTALL)
+        if json_match:
+            items = json.loads(json_match.group(1))
+            for item in items[:8]:
+                target = item.get("target", {})
+                title = target.get("titleArea", {}).get("text", "") or target.get("title", "")
+                url_token = target.get("link", {}).get("url", "")
+                heat = item.get("detailText", "")
+                if title:
+                    results.append({
+                        "title": f"[知乎] {title}",
+                        "url": url_token or "https://www.zhihu.com/hot",
+                        "snippet": heat,
+                        "engine": "ZhihuHot"
+                    })
+        else:
+            # Fallback: regex scrape
+            titles = re.findall(r'<h2[^>]*class="[^"]*HotList-itemTitle[^"]*"[^>]*>(.*?)</h2>', html)
+            for t in titles[:8]:
+                clean = re.sub(r'<[^>]+>', '', t).strip()
+                if clean:
+                    results.append({
+                        "title": f"[知乎热榜] {clean}",
+                        "url": "https://www.zhihu.com/hot",
+                        "snippet": "知乎实时热点",
+                        "engine": "ZhihuHot"
+                    })
+    except Exception as e:
+        print(f"  [Zhihu] {e}", file=sys.stderr)
+    return results
+
+
+def search_world_bank(indicator, country="CN"):
+    """世界银行 API — 全球宏观经济指标，免费CORS开放。"""
+    results = []
+    try:
+        url = f"https://api.worldbank.org/v2/country/{country}/indicator/{indicator}?format=json&mrv=3"
+        data = json.loads(_fetch(url, timeout=8))
+        if len(data) >= 2:
+            records = data[1] or []
+            for rec in records[:3]:
+                if rec.get("value") is not None:
+                    country_name = rec.get("country", {}).get("value", country)
+                    ind_name = rec.get("indicator", {}).get("value", indicator)
+                    val = rec.get("value")
+                    year = rec.get("date", "")
+                    results.append({
+                        "title": f"[世界银行] {country_name} {ind_name}",
+                        "url": f"https://data.worldbank.org/indicator/{indicator}?locations={country}",
+                        "snippet": f"{year}年: {val:,.2f}" if isinstance(val, float) else f"{year}年: {val}",
+                        "engine": "WorldBank"
+                    })
+    except Exception as e:
+        print(f"  [WorldBank] {e}", file=sys.stderr)
+    return results
+
+
+def search_cvedb(keyword, max_results=4):
+    """NVD CVE 漏洞数据库 — 安全漏洞搜索，免费CORS开放。"""
+    results = []
+    try:
+        params = urllib.parse.urlencode({
+            "keywordSearch": keyword, "resultsPerPage": max_results
+        })
+        url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?{params}"
+        data = json.loads(_fetch(url, timeout=10))
+        for vuln in data.get("vulnerabilities", [])[:max_results]:
+            cve = vuln.get("cve", {})
+            cve_id = cve.get("id", "")
+            descs = cve.get("descriptions", [])
+            desc = next((d["value"] for d in descs if d.get("lang") == "en"), "")[:150]
+            metrics = cve.get("metrics", {})
+            score = ""
+            if "cvssMetricV31" in metrics:
+                score = f"CVSS3.1: {metrics['cvssMetricV31'][0]['cvssData']['baseScore']}"
+            elif "cvssMetricV2" in metrics:
+                score = f"CVSS2: {metrics['cvssMetricV2'][0]['cvssData']['baseScore']}"
+            published = cve.get("published", "")[:10]
+            results.append({
+                "title": f"[CVE] {cve_id} {score}",
+                "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+                "snippet": f"{published} — {desc}",
+                "engine": "NVD"
+            })
+    except Exception as e:
+        print(f"  [NVD] {e}", file=sys.stderr)
+    return results
+
+
+def search_pengpai_rss(query=""):
+    """澎湃新闻 RSS — 深度报道，中文高质量新闻，免费。"""
+    results = []
+    try:
+        rss_urls = [
+            ("https://www.thepaper.cn/rss_cm.jsp", "澎湃新闻"),
+            ("https://feedx.net/rss/pengpai.xml", "澎湃新闻(镜像)"),
+        ]
+        for rss_url, src_name in rss_urls:
+            try:
+                xml = _fetch(rss_url, timeout=6)
+                items = re.findall(r'<item>(.*?)</item>', xml, re.DOTALL)
+                for item in items[:4]:
+                    title_m = re.search(r'<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>', item)
+                    link_m = re.search(r'<link>(.*?)</link>', item)
+                    pub_m = re.search(r'<pubDate>(.*?)</pubDate>', item)
+                    title = (title_m.group(1) or title_m.group(2) or "").strip() if title_m else ""
+                    link = link_m.group(1).strip() if link_m else ""
+                    pub = pub_m.group(1)[:16] if pub_m else ""
+                    if title and (not query or any(w in title for w in query.split())):
+                        results.append({
+                            "title": f"[{src_name}] {title}",
+                            "url": link,
+                            "snippet": pub,
+                            "engine": "PengPai"
+                        })
+                if results:
+                    break
+            except:
+                continue
+    except Exception as e:
+        print(f"  [PengPai] {e}", file=sys.stderr)
+    return results
+
+
+def search_xinhua_rss(query=""):
+    """新华社 RSS — 官方权威新闻，实时。"""
+    results = []
+    try:
+        rss_urls = [
+            "https://www.xinhuanet.com/politics/news_politics.xml",
+            "https://www.xinhuanet.com/world/news_world.xml",
+        ]
+        for rss_url in rss_urls[:1]:
+            try:
+                xml = _fetch(rss_url, timeout=6)
+                items = re.findall(r'<item>(.*?)</item>', xml, re.DOTALL)
+                for item in items[:4]:
+                    title_m = re.search(r'<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>', item)
+                    link_m = re.search(r'<link>(https?://[^<]+)</link>', item)
+                    desc_m = re.search(r'<description><!\[CDATA\[(.*?)\]\]></description>|<description>(.*?)</description>', item, re.DOTALL)
+                    title = (title_m.group(1) or title_m.group(2) or "").strip() if title_m else ""
+                    link = link_m.group(1).strip() if link_m else ""
+                    desc = re.sub(r'<[^>]+>', '', (desc_m.group(1) or desc_m.group(2) or ""))[:100].strip() if desc_m else ""
+                    if title:
+                        results.append({
+                            "title": f"[新华社] {title}",
+                            "url": link,
+                            "snippet": desc,
+                            "engine": "Xinhua"
+                        })
+            except:
+                continue
+    except Exception as e:
+        print(f"  [Xinhua] {e}", file=sys.stderr)
+    return results
+
+
+def search_coingecko(query="", top_n=5):
+    """CoinGecko — 10000+加密货币，市值/价格/变化，免费无key。"""
+    results = []
+    try:
+        if query:
+            # Search by name
+            params = urllib.parse.urlencode({"query": query})
+            data = json.loads(_fetch(f"https://api.coingecko.com/api/v3/search?{params}", timeout=8))
+            coin_ids = [c["id"] for c in data.get("coins", [])[:3]]
+        else:
+            # Top coins by market cap
+            coin_ids = ["bitcoin","ethereum","binancecoin","solana","ripple"]
+        if not coin_ids:
+            return results
+        ids_str = ",".join(coin_ids[:5])
+        url = f"https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids={ids_str}&order=market_cap_desc"
+        coins = json.loads(_fetch(url, timeout=8))
+        for c in coins[:top_n]:
+            name = c.get("name","")
+            sym = c.get("symbol","").upper()
+            price = c.get("current_price", 0)
+            change24h = c.get("price_change_percentage_24h", 0)
+            mcap = c.get("market_cap", 0)
+            results.append({
+                "title": f"[CoinGecko] {name} ({sym})",
+                "url": f"https://www.coingecko.com/en/coins/{c.get('id','')}",
+                "snippet": f"${price:,.4f} | 24h:{change24h:+.2f}% | 市值:${mcap/1e9:.2f}B",
+                "engine": "CoinGecko"
+            })
+    except Exception as e:
+        print(f"  [CoinGecko] {e}", file=sys.stderr)
+    return results
+
+
+def search_earthquake(min_mag=4.5, limit=5):
+    """USGS 地震数据 — 全球实时地震信息，免费CORS开放。"""
+    from datetime import datetime
+    results = []
+    try:
+        params = urllib.parse.urlencode({
+            "format": "geojson", "limit": limit,
+            "minmagnitude": min_mag, "orderby": "time"
+        })
+        url = f"https://earthquake.usgs.gov/fdsnws/event/1/query?{params}"
+        data = json.loads(_fetch(url, timeout=8))
+        for feat in data.get("features", [])[:limit]:
+            props = feat.get("properties", {})
+            place = props.get("place", "")
+            mag = props.get("mag", 0)
+            t = props.get("time", 0)
+            event_url = props.get("url", "")
+            ts = datetime.fromtimestamp(t/1000).strftime('%Y-%m-%d %H:%M') if t else ""
+            results.append({
+                "title": f"[地震] M{mag} {place}",
+                "url": event_url,
+                "snippet": ts,
+                "engine": "USGS"
+            })
+    except Exception as e:
+        print(f"  [USGS] {e}", file=sys.stderr)
+    return results
+
+
+def search_wikidata_entity(query):
+    """Wikidata SPARQL — 结构化知识图谱，实体/关系查询，免费无key。"""
+    results = []
+    try:
+        # Entity search first
+        params = urllib.parse.urlencode({
+            "action": "wbsearchentities", "search": query,
+            "language": "zh", "limit": 3, "format": "json"
+        })
+        data = json.loads(_fetch(f"https://www.wikidata.org/w/api.php?{params}", timeout=8))
+        for item in data.get("search", [])[:3]:
+            qid = item.get("id", "")
+            label = item.get("label", "")
+            desc = item.get("description", "")
+            results.append({
+                "title": f"[Wikidata] {label} ({qid})",
+                "url": f"https://www.wikidata.org/wiki/{qid}",
+                "snippet": desc,
+                "engine": "Wikidata"
+            })
+    except Exception as e:
+        print(f"  [Wikidata] {e}", file=sys.stderr)
+    return results
+
+
+def search_frankfurter_forex(base="USD", targets=None):
+    """Frankfurter 欧洲央行汇率 — 免费CORS开放，168种货币，比OpenER更稳定。"""
+    results = []
+    if not targets:
+        targets = ["CNY", "EUR", "JPY", "GBP", "HKD"]
+    try:
+        symbols = ",".join(targets)
+        url = f"https://api.frankfurter.app/latest?from={base}&to={symbols}"
+        data = json.loads(_fetch(url, timeout=8))
+        rates = data.get("rates", {})
+        date = data.get("date", "")
+        for target, rate in rates.items():
+            results.append({
+                "title": f"[ECB汇率] {base}/{target}",
+                "url": f"https://www.frankfurter.app/",
+                "snippet": f"{date} | 1 {base} = {rate} {target}",
+                "engine": "Frankfurter"
+            })
+    except Exception as e:
+        print(f"  [Frankfurter] {e}", file=sys.stderr)
+    return results
+
+
+def search_holiday(country="CN", year=None):
+    """公共假日查询 — Nager.Date API，全球法定节假日，免费CORS开放。"""
+    from datetime import datetime
+    results = []
+    try:
+        if not year:
+            year = datetime.now().year
+        url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/{country}"
+        holidays = json.loads(_fetch(url, timeout=8))
+        for h in holidays[:8]:
+            date = h.get("date", "")
+            name = h.get("localName") or h.get("name", "")
+            is_national = h.get("global", True)
+            if is_national:
+                results.append({
+                    "title": f"[假日] {name}",
+                    "url": f"https://date.nager.at/",
+                    "snippet": date,
+                    "engine": "PublicHoliday"
+                })
+    except Exception as e:
+        print(f"  [Holiday] {e}", file=sys.stderr)
+    return results
+
+
+def search_ipinfo(ip=""):
+    """IP地理位置 — ipapi.co，免费1000次/天，CORS开放。"""
+    results = []
+    try:
+        url = f"https://ipapi.co/{ip}/json/" if ip else "https://ipapi.co/json/"
+        data = json.loads(_fetch(url, timeout=6))
+        city = data.get("city","")
+        region = data.get("region","")
+        country = data.get("country_name","")
+        org = data.get("org","")
+        ip_addr = data.get("ip","")
+        results.append({
+            "title": f"[IP定位] {ip_addr}",
+            "url": f"https://ipapi.co/{ip_addr}/",
+            "snippet": f"{country} {region} {city} — {org}",
+            "engine": "ipapi"
+        })
+    except Exception as e:
+        print(f"  [ipapi] {e}", file=sys.stderr)
+    return results
+
+
 def web_search(query, num=10, timeout=10):
     """Multi-engine search: Sogou + Bing + DuckDuckGo.
     Runs engines in parallel, merges and deduplicates by URL.
     Uses only Python standard library.
     """
     import concurrent.futures
-    _all_engines = [_ddg_search, _bing_search, _sogou_search]
-    _engine_names = {'_ddg_search': 'DDG', '_bing_search': 'Bing', '_sogou_search': 'Sogou'}
+    _all_engines = [_ddg_search, _bing_search, _sogou_search, _searxng_search]
+    _engine_names = {'_ddg_search': 'DDG', '_bing_search': 'Bing', '_sogou_search': 'Sogou', '_searxng_search': 'SearXNG'}
     engines = [fn for fn in _all_engines if _engine_ok(_engine_names.get(fn.__name__, fn.__name__))]
     if not engines:
         for k in _ENGINE_FAILS: _ENGINE_FAILS[k] = 0
@@ -1146,6 +1900,7 @@ def web_search(query, num=10, timeout=10):
         # Engine bonus
         if r.get("engine") == "Sogou": score += 1
         elif r.get("engine") == "Bing": score += 0.5
+        elif r.get("engine") == "SearXNG": score += 2  # Self-hosted = freshest results, no anti-bot
         # Date freshness bonus: extract recent dates from snippet
         date_matches = re.findall(r'(\d{4}).*?(\d{1,2})\D+(\d{1,2})', snippet_lower + title_lower)
         if date_matches:
@@ -1545,6 +2300,43 @@ def _detect_schema_hint(query):
     return None
 
 
+def extract_entities(user_msg, assistant_msg, api_key, timeout=10):
+    """Lightweight entity extraction from a conversation turn.
+    Returns list of {type, value, context} or [] on failure. Cheap — uses V3, <100 tokens."""
+    if not api_key or len(user_msg) < 10:
+        return []
+    prompt = (
+        "从下面这轮对话提取关键实体（人名/地名/产品/项目/偏好/重要事实），"
+        "最多5个，无关紧要的不提取。只返回JSON数组，每项 {\"type\":\"person|place|product|preference|fact\","
+        "\"value\":\"...\",\"context\":\"简短说明\"}。无相关实体则返回 []。\n\n"
+        f"用户: {user_msg[:300]}\nAI: {assistant_msg[:300]}"
+    )
+    try:
+        body = json.dumps({
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 300, "temperature": 0
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.deepseek.com/v1/chat/completions",
+            data=body, method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        content = data["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1]
+        if content.endswith("```"):
+            content = content.rsplit("\n", 1)[0]
+        content = content.strip()
+        entities = json.loads(content)
+        return entities if isinstance(entities, list) else []
+    except Exception as e:
+        print(f"  [EntityExtract] {e}", file=sys.stderr)
+        return []
+
+
 def ai_extract(text, query, api_key, schema_hint=None, timeout=30):
     """
     Send compressed text to DeepSeek for structured data extraction.
@@ -1726,7 +2518,7 @@ _TOOL_NAME_MAP = {
     "run_shell": ("shell", None),
 }
 
-_TOOL_SYSTEM_PROMPT = """\n\n## 本地工具调用\n\n你可以使用以下工具操作本地电脑。工具会在你输出调用指令后自动执行，结果会注入对话。\n\nread_file(path): 读取文件内容。path 必须在 workspace/data/uploads 目录内。\nwrite_file(path, content): 写入文件，覆盖已存在文件。\nappend_file(path, content): 追加内容到文件末尾。\nlist_directory(path): 列出目录内容。\ncreate_directory(path): 创建新目录。\nmove_file(src, dst): 移动或重命名文件。\ndelete_file(path): 删除文件。\nfile_info(path): 获取文件信息（大小、修改时间）。\nrun_command(command): 在沙箱中执行 Shell 命令。仅白名单命令可用。\nscreenshot(): 截取屏幕截图，返回 base64 PNG。\nclick(x, y, button, clicks): 模拟鼠标点击。button: left/right/middle。需要用户确认。\ntype_text(text, interval): 在当前光标位置输入文本。非 ASCII 文本用剪贴板粘贴。需要用户确认。\nhotkey(keys): 发送键盘快捷键（如 ctrl+c）。blocked: Ctrl+Alt+Del/Win+R。需要用户确认。\nbrowser_open(url, newTab): 在默认浏览器中打开指定 URL（用于页面测试）。\ntask_create(interval, taskAction, label): 创建定时任务：interval=秒, taskAction=screenshot/ping。最小间隔 5 秒。\ntask_stop(taskId): 停止并删除指定定时任务。\n\n调用格式：\n[TOOL:read_file path="data/example.txt"]\n[TOOL:run_command command="ls workspace/"]\n[TOOL:screenshot {}]\n[TOOL:click x="100" y="200" button="left"]\n[TOOL:type_text text="你好世界"]\n[TOOL:hotkey keys="ctrl+s"]\n[TOOL:browser_open url="http://localhost:8082"]\n[TOOL:task_create interval="60" taskAction="screenshot"]\n\n工具结果会自动注入，继续推理。一次只调用一个工具，等待结果后决定下一步。"""
+_TOOL_SYSTEM_PROMPT = """\n\n## 本地工具调用\n\n你可以使用以下工具操作本地电脑。工具会在你输出调用指令后自动执行，结果会注入对话。\n\nread_file(path): 读取文件内容。path 必须在 workspace/data/uploads 目录内。\nwrite_file(path, content): 写入文件，覆盖已存在文件。content 内 \\n 表示换行、\\t 制表、\\" 表示引号、\\\\ 表示反斜杠。\nappend_file(path, content): 追加内容到文件末尾。转义规则同 write_file。\nlist_directory(path): 列出目录内容。\ncreate_directory(path): 创建新目录。\nmove_file(src, dst): 移动或重命名文件。\ndelete_file(path): 删除文件。\nfile_info(path): 获取文件信息（大小、修改时间）。\nrun_command(command): 在沙箱中执行 Shell 命令。仅白名单命令可用。\nscreenshot(save_path): 截取屏幕截图。save_path 必传！指定保存路径为桌面：C:\\Users\\iobcn\\Desktop\\（以 \\ 结尾自动生成文件名）。不用 save_path 截图不会存到桌面！\nclick(x, y, button, clicks): 模拟鼠标点击。button: left/right/middle。需要用户确认。\ntype_text(text, interval): 在当前光标位置输入文本。非 ASCII 文本用剪贴板粘贴。需要用户确认。\nhotkey(keys): 发送键盘快捷键（如 ctrl+c）。blocked: Ctrl+Alt+Del/Win+R。需要用户确认。\nbrowser_open(url, newTab): 在默认浏览器中打开指定 URL（用于页面测试）。\ntask_create(interval, taskAction, label): 创建定时任务：interval=秒, taskAction=screenshot/ping。最小间隔 5 秒。\ntask_stop(taskId): 停止并删除指定定时任务。\n\n调用格式：\n[TOOL:read_file path="data/example.txt"]\n[TOOL:run_command command="ls workspace/"]\n[TOOL:screenshot save_path="C:\\Users\\iobcn\\Desktop\\"]\n[TOOL:click x="100" y="200" button="left"]\n[TOOL:type_text text="你好世界"]\n[TOOL:hotkey keys="ctrl+s"]\n[TOOL:browser_open url="http://localhost:8082"]\n[TOOL:task_create interval="60" taskAction="screenshot"]\n\n工具结果会自动注入，继续推理。一次只调用一个工具，等待结果后决定下一步。\n\n重要：工具执行完成后，只需简洁告诉用户结果（如"已完成"、"截图已保存到桌面"）。不要输出工具调用代码、base64数据、JSON原始结果。如果工具失败，只说原因（如"截图失败：桌面自动化未开启"）。\n\n\n## 交互规则\n\n与用户沟通时遵循：\n\n1. **消息含义明确** → 直接执行，不啰嗦\n2. **消息简短模糊**（如"计算器""优化""那个文件"）→ 不要猜测后直接做。用以下格式列出 2-3 个最可能的理解：\n\n[CHOICE:1] 选项描述（一句话说清做什么）\n[CHOICE:2] 选项描述\n\n格式要求：\n- 每个 [CHOICE] 独占一行，不要加破折号或编号\n- 选项描述以动词开头（"写一个...""搜索...""打开..."）\n- 选项后附简短提示（"回复数字即可，或直接说你的想法"）\n- 只真正模糊时用，明确消息不强行列选项\n\n示例：\n用户："计算器" → [CHOICE:1] 写一个网页版科学计算器 HTML\n[CHOICE:2] 用 Python 写命令行计算器\n[CHOICE:3] 搜索在线计算器推荐\n回复数字即可，或直接说你的想法"""
 
 
 def _log_tool_action(action, ok=True, duration=0, tool="file"):
@@ -1745,6 +2537,18 @@ def _log_tool_action(action, ok=True, duration=0, tool="file"):
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
     except Exception:
         pass
+
+
+def _unescape_content(s):
+    """Convert JSON-style escape sequences to actual characters.
+    Handles \\n, \\t, \\\", \\\\ in file content from AI TOOL calls.
+    Uses placeholder to avoid double-processing (\\n should stay literal backslash+n)."""
+    s = s.replace('\\\\', '\x00')  # placeholder for backslash
+    s = s.replace('\\n', '\n')
+    s = s.replace('\\t', '\t')
+    s = s.replace('\\"', '"')
+    s = s.replace('\x00', '\\')    # restore placeholder
+    return s
 
 
 def _sanitize_path(path):
@@ -1782,7 +2586,7 @@ def _run_file_tool(tool, params):
         elif tool in ("write_file", "file_write"):
             path = _sanitize_path(params.get("path", ""))
             _check_not_blocked(path)
-            content = params.get("content", "")
+            content = _unescape_content(params.get("content", ""))
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(content)
@@ -1792,7 +2596,7 @@ def _run_file_tool(tool, params):
         elif tool in ("append_file", "file_append"):
             path = _sanitize_path(params.get("path", ""))
             _check_not_blocked(path)
-            content = params.get("content", "")
+            content = _unescape_content(params.get("content", ""))
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, 'a', encoding='utf-8') as f:
                 f.write(content)
@@ -1981,7 +2785,7 @@ def _execute_tool_from_str(tool_name, args_str, api_key=None):
     # Desktop automation tools (routed via tool args directly)
     args = _parse_tool_args(args_str)
     if tool_name == "screenshot":
-        result = tool_screenshot(region=args.get("region"))
+        result = tool_screenshot(region=args.get("region"), save_path=args.get("save_path"))
     elif tool_name == "click":
         result = tool_mouse_click(int(args.get("x", 0)), int(args.get("y", 0)),
                                   button=args.get("button", "left"),
@@ -2008,15 +2812,25 @@ def _execute_tool_from_str(tool_name, args_str, api_key=None):
 
 
 def _fmt_tool_result(tool_name, result):
-    """Format tool execution result as XML for AI continuation."""
+    """Format tool execution result as XML for AI continuation.
+    Base64/image data is truncated to avoid context blow-up."""
     ok = result.get("ok", False)
     parts = [f'<tool_result tool="{tool_name}" ok="{str(ok).lower()}">']
     if result.get("content"):
-        parts.append(result["content"])
+        parts.append(str(result["content"])[:5000])
     if result.get("stdout"):
-        parts.append(result["stdout"][:3000])
+        parts.append(str(result["stdout"])[:3000])
     if result.get("stderr"):
-        parts.append(f'<stderr>{result["stderr"][:1000]}</stderr>')
+        parts.append(f'<stderr>{str(result["stderr"])[:1000]}</stderr>')
+    if result.get("saved"):
+        parts.append(f'<saved>{result["saved"]}</saved>')
+        if result.get("file_size_kb"):
+            parts.append(f'<size>{result["file_size_kb"]}KB</size>')
+    if result.get("image_b64"):
+        # ⚠️ No file was saved! AI MUST retry with save_path.
+        b64 = result["image_b64"]
+        sz = result.get("size", [])
+        parts.append(f'<error>文件未保存！截图仅返回了 base64 数据 ({len(b64)//1024}KB)。必须用 save_path="C:\\\\Users\\\\iobcn\\\\Desktop\\\\" 重新调用才能存到桌面！不要告诉用户截图已保存，因为根本没有保存文件。</error>')
     if result.get("error"):
         parts.append(f'<error>{result["error"]}</error>')
     if result.get("truncated"):
@@ -2057,8 +2871,9 @@ def _check_auto_deps():
     except ImportError: d['pillow'] = False
     return d
 
-def tool_screenshot(region=None):
-    """Screenshot → base64 PNG. Optional region=(x,y,w,h)."""
+def tool_screenshot(region=None, save_path=None):
+    """Screenshot → base64 PNG (or save to file if save_path given).
+    Optional region=(x,y,w,h)."""
     if not _AUTO_ENABLED:
         return {"ok": False, "error": "桌面自动化未启用"}
     try:
@@ -2069,6 +2884,19 @@ def tool_screenshot(region=None):
         w, h = img.size
         if w > 1280:
             img = img.resize((1280, int(h * 1280 / w)), Image.LANCZOS)
+        # Auto-generate filename if save_path is a directory
+        if save_path:
+            sp = os.path.expandvars(os.path.expanduser(save_path))
+            if os.path.isdir(sp) or sp.endswith(('/', '\\')):
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                sp = os.path.join(sp, f"screenshot_{ts}.png")
+            os.makedirs(os.path.dirname(sp) or '.', exist_ok=True)
+            img.save(sp, format="PNG", optimize=True)
+            fsize = os.path.getsize(sp)
+            _log_tool_action("screenshot", ok=True, tool="auto")
+            return {"ok": True, "saved": sp, "size": list(img.size),
+                    "file_size_kb": round(fsize / 1024, 1)}
+        # Return base64
         buf = io.BytesIO()
         img.save(buf, format="PNG", optimize=True)
         _log_tool_action("screenshot", ok=True, tool="auto")
@@ -2138,6 +2966,10 @@ def tool_hotkey(*keys):
 
 def tool_browser_open(url, new_tab=True):
     """Open URL in default browser. For page testing."""
+    # Never open the app's own URL — prevents infinite window spam
+    import re
+    if re.search(r'localhost:8082|127\.0\.0\.1:8082|0\.0\.0\.0:8082', url):
+        return {"ok": False, "error": "不能打开USB-AI自身地址"}
     try:
         import webbrowser
         webbrowser.open(url, new=1 if new_tab else 0)
@@ -2236,10 +3068,17 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                     with urllib.request.urlopen(req, timeout=6) as r:
                         diag[name] = "OK (%d bytes)" % len(r.read())
                 except Exception as e: diag[name] = "FAIL: %s" % str(e)[:80]
+            # Check local SearXNG
+            try:
+                req = urllib.request.Request(_SEARXNG_URL + "/search?q=test&format=json", headers={"User-Agent":_UA, "Accept":"application/json"})
+                with urllib.request.urlopen(req, timeout=4) as r:
+                    diag["SearXNG"] = "RUNNING"
+            except Exception as e:
+                diag["SearXNG"] = "STOPPED: %s" % str(e)[:60]
             self._send_json(diag)
             return
         if self.path == "/api/ping":
-            self._send_json({"ok": True, "engines": ["Sogou", "Bing", "DuckDuckGo"], "version": "4.1"})
+            self._send_json({"ok": True, "engines": ["Sogou", "Bing", "DuckDuckGo", "SearXNG"], "version": "4.1"})
             return
         # Network info for QR code / mobile access
         if self.path == "/api/network-info":
@@ -2250,6 +3089,11 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                 "lanIp": lan_ip,
                 "port": PORT
             })
+            return
+        # Entity memory (GET)
+        if self.path == "/api/entities":
+            entities = db.get_top_entities(limit=10)
+            self._send_json({"entities": entities})
             return
         # Local LLM status
         if self.path == "/api/local-llm/status":
@@ -2318,6 +3162,8 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._handle_tool()
         elif self.path == "/api/classify":
             self._handle_classify()
+        elif self.path == "/api/entities/extract":
+            self._handle_entities_extract()
         elif self.path == "/api/local-llm/load":
             self._handle_local_load()
         elif self.path == "/api/local-llm/unload":
@@ -2354,6 +3200,11 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         if ':' in model:  # Ollama model tag format
             return "http://localhost:11434/v1/chat/completions", False
         return "https://api.deepseek.com/v1/chat/completions", True
+
+    def _inject_prompt_cache(self, body_json):
+        """Prompt cache disabled — DeepSeek API may not support cache_control format.
+        TODO: re-enable after verifying DeepSeek support for ephemeral cache_control."""
+        return body_json
 
     def _local_chat_completion(self, messages, stream=False, max_tokens=4096):
         """Call local llama-cpp-python model. Returns (ok, result)."""
@@ -2438,7 +3289,7 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
     def _handle_auto_screenshot(self):
         if not self._require_auto_token(): return
         body = self._read_body()
-        result = tool_screenshot(region=body.get("region"))
+        result = tool_screenshot(region=body.get("region"), save_path=body.get("save_path"))
         self._send_json(result)
 
     def _handle_auto_click(self):
@@ -2555,13 +3406,31 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         else:
             self._send_json({"ok": False, "error": "action 须为 install/uninstall"})
 
+    def _send_sse_error(self, msg):
+        """Send an error as proper SSE event and close stream."""
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", "http://localhost:%d" % PORT))
+            self.end_headers()
+            self.wfile.write(f'data: {{"error":"{msg}"}}\n\n'.encode())
+            self.wfile.write(b'data: [DONE]\n\n')
+            self.wfile.flush()
+        except Exception:
+            pass  # Best effort — connection may already be dead
+
     def _handle_deepseek_stream(self):
         """Streaming SSE proxy with P3 TOOL protocol support."""
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
         api_key = self.headers.get("X-API-Key", "")
 
-        body_json = json.loads(body)
+        try:
+            body_json = json.loads(body)
+        except json.JSONDecodeError as e:
+            self._send_sse_error(f"请求JSON解析失败: {str(e)[:200]}")
+            return
         body_json["stream"] = True
         model = body_json.get("model", "")
         # Route to local model if model name starts with _local_
@@ -2587,7 +3456,12 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
         api_url, needs_auth = self._get_llm_url(model)
 
         # Inject P3 TOOL system prompt into system message
-        _inject_tool_prompt(body_json)
+        try:
+            _inject_tool_prompt(body_json)
+        except Exception as e:
+            self._send_sse_error(f"工具提示注入失败: {str(e)[:200]}")
+            return
+        body_json = self._inject_prompt_cache(body_json)
 
         # Send SSE headers
         self.send_response(200)
@@ -2604,11 +3478,15 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                 headers["Authorization"] = f"Bearer {api_key}"
 
             body_enc = json.dumps(body_json).encode("utf-8")
+            import datetime as _dt
+            _log_msg = f"[{_dt.datetime.now().strftime('%H:%M:%S')}] STREAM -> {api_url} model={model} key={'***' if api_key else 'MISSING'} body={len(body_enc)}bytes"
+            print(_log_msg)
+            with open("server_debug.log", "a", encoding="utf-8") as _f: _f.write(_log_msg + "\n")
             req = urllib.request.Request(api_url, data=body_enc, headers=headers, method="POST")
 
             full_text = ""
             try:
-                with urllib.request.urlopen(req, timeout=180) as resp:
+                with urllib.request.urlopen(req, timeout=60) as resp:
                     while True:
                         chunk = resp.readline()
                         if not chunk:
@@ -2636,6 +3514,13 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.flush()
                 return
             except Exception as e:
+                import traceback, datetime as _dt
+                _err_msg = f"[{_dt.datetime.now().strftime('%H:%M:%S')}] STREAM API FAIL: {api_url} | {e}"
+                print(_err_msg)
+                traceback.print_exc()
+                with open("server_debug.log", "a", encoding="utf-8") as _f:
+                    _f.write(_err_msg + "\n")
+                    traceback.print_exc(file=_f)
                 self.wfile.write(f'data: {{"error":"{str(e)}"}}\n\n'.encode())
                 self.wfile.write(b'data: [DONE]\n\n')
                 self.wfile.flush()
@@ -2696,6 +3581,7 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
 
             # Inject P3 TOOL system prompt
             _inject_tool_prompt(body_json)
+            body_json = self._inject_prompt_cache(body_json)
 
             max_rounds = 5
             resp_status = 200
@@ -2817,6 +3703,26 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                 (["战争","冲突","军事","导弹","制裁","袭击","局势","入侵","空袭",
                   "选举","当选","总统","抗议","罢工","政变","法案","外交",
                   "新闻","最新","热点","快讯","动态","进展","什么情况"], search_news, True),
+                # ---- 新增路由 ----
+                (["BNB","SOL","Solana","狗狗币","DOGE","SHIB","ADA","DOT","MATIC","币价","代币","市值"], search_coingecko, True),
+                (["arxiv","论文","预印本","paper","研究","学术","AI研究","机器学习论文","deep learning"], search_arxiv, True),
+                (["pubmed","医学文献","临床研究","药物研究","基因","生物医学"], search_pubmed, True),
+                (["github","开源","代码仓库","star","fork","仓库","repo"], search_github, True),
+                (["stackoverflow","报错","stack overflow","编程问题","代码错误","怎么实现"], search_stackoverflow, True),
+                (["npm","node包","javascript库","react库","前端依赖"], search_npm, True),
+                (["pypi","python包","pip install","python库"], search_pypi, True),
+                (["b站","bilibili","热门视频","up主","弹幕","番剧"], search_bilibili_hot, False),
+                (["微博热搜","微博热点","微博榜","热搜榜"], search_weibo_hot, False),
+                (["知乎热榜","知乎热点","知乎话题"], search_zhihu_hot, False),
+                (["地震","震级","地震带","发生地震"], search_earthquake, False),
+                (["漏洞","CVE","安全漏洞","exploit","vulnerability","RCE","XSS"], search_cvedb, True),
+                (["节假日","法定假日","公共假期","几号放假","假期安排"], search_holiday, False),
+                (["GDP","CPI","通胀","失业率","贸易顺差","宏观经济","世界银行"], lambda q: search_world_bank("NY.GDP.MKTP.CD"), False),
+                (["澎湃","深度报道","中国新闻","时政新闻"], search_pengpai_rss, True),
+                (["新华社","官方新闻","新华","人民日报"], search_xinhua_rss, True),
+                (["ip地址","我的ip","ip归属","ip查询","ip定位"], search_ipinfo, True),
+                (["实体","是什么","百科","维基数据","wikidata"], search_wikidata_entity, True),
+                (["黑客新闻","hacker news","技术热点","科技动态","ProductHunt"], search_hacker_news, True),
             ]:
                 if any(k in raw_query for k in _tags):
                     results = (_fn(raw_query) if _need_raw else _fn()) + results
@@ -2866,6 +3772,14 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
 
             api_key = self.headers.get("X-API-Key", "")
             query = optimize_query(raw_query) if not lottery_type else raw_query
+            # HyDE: for longer knowledge-seeking queries, generate a hypothetical
+            # answer to bridge the vocabulary gap between questions and documents
+            if len(query) >= 12 and api_key and not lottery_type \
+               and not re.search(r'^(谁是|什么是|几点|多少钱|今天|现在)', query):
+                hyde_q = generate_hyde_query(query, api_key, timeout=6)
+                if hyde_q and hyde_q != query:
+                    query = f"{query} {hyde_q[:60]}"
+                    print(f"  [HyDE] {raw_query[:30]}... -> {hyde_q[:50]}...")
 
             # Step 1: Search or Direct Lottery Fetch
             if lottery_type:
@@ -2930,6 +3844,25 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                     (["战争","冲突","军事","导弹","制裁","袭击","局势","入侵","空袭",
                       "选举","当选","总统","抗议","罢工","政变","法案","外交",
                       "新闻","最新","热点","快讯","动态","进展","什么情况"], search_news, True),
+                    # ---- 新增 RAG 路由 ----
+                    (["BNB","SOL","Solana","狗狗币","DOGE","SHIB","ADA","DOT","MATIC","币价","代币","市值"], search_coingecko, True),
+                    (["arxiv","论文","预印本","paper","研究","学术","AI研究","机器学习论文","deep learning"], search_arxiv, True),
+                    (["pubmed","医学","临床","药物","基因","生物医学","医学文献"], search_pubmed, True),
+                    (["github","开源","代码仓库","star","仓库","repo"], search_github, True),
+                    (["stackoverflow","报错","编程问题","代码错误"], search_stackoverflow, True),
+                    (["npm","node包","javascript库","前端依赖"], search_npm, True),
+                    (["pypi","python包","pip install","python库"], search_pypi, True),
+                    (["b站","bilibili","热门视频"], search_bilibili_hot, False),
+                    (["微博热搜","微博热点","热搜榜"], search_weibo_hot, False),
+                    (["知乎热榜","知乎话题"], search_zhihu_hot, False),
+                    (["地震","震级"], search_earthquake, False),
+                    (["漏洞","CVE","安全漏洞","exploit","vulnerability"], search_cvedb, True),
+                    (["节假日","法定假日","假期安排"], search_holiday, False),
+                    (["澎湃","深度报道","中国时政"], search_pengpai_rss, True),
+                    (["新华社","官方新闻"], search_xinhua_rss, True),
+                    (["ip地址","ip归属","ip查询"], search_ipinfo, True),
+                    (["实体","维基数据","wikidata"], search_wikidata_entity, True),
+                    (["hacker news","技术热点","科技社区"], search_hacker_news, True),
                 ]:
                     if any(k in raw_query for k in _tags):
                         _futures.append(_ex.submit(_fn, raw_query) if _need_raw else _ex.submit(_fn))
@@ -2940,6 +3873,19 @@ class AIProxyHandler(http.server.SimpleHTTPRequestHandler):
                     try: results.extend(_f.result())
                     except: pass
                 _ex.shutdown(wait=False)  # Don't block on unfinished web_search
+
+                # Step-Back: for long/specific queries, also search a broader
+                # background query to capture context the specific query misses
+                if len(query) >= 15 and api_key:
+                    stepback_q = generate_stepback_query(query, api_key, timeout=5)
+                    if stepback_q:
+                        print(f"  [StepBack] {query[:30]}... -> {stepback_q}")
+                        try:
+                            sb_results = web_search(stepback_q, num=3, timeout=6)
+                            if sb_results:
+                                results = sb_results[:2] + results
+                        except Exception as e:
+                            print(f"  [StepBack search] {e}", file=sys.stderr)
 
                 if not results:
                     # Retry: use raw_query directly (query may have lost key digits from optimize_query)
@@ -3144,8 +4090,8 @@ Current Date: {_now.strftime('%Y-%m-%d')}
 
             # Regex-based classification (fast, no API cost)
             lottery_re = r'彩票|开奖|号码|快乐8|大乐透|双色球|排列|福彩|体彩|中奖|选五|选九|选十'
-            realtime_re = r'天气|股价|股票|汇率|新闻|最新|今天|现在|实时|比分|赛程|比赛|世界杯|欧冠|NBA|足球|篮球|网球|F1|奥运|金牌|金牌榜|高考|中考|真题|试题|作文|分数线|录取|成绩|体育|中超|英超|西甲|意甲|亚运|冠军|电竞|汽车|车型|新能源|电动车|特斯拉|续航|电器|家电|电视|冰箱|洗衣机|空调|电脑|编程|代码|开发|芯片|半导体|软件|军事|军队|武器|导弹|航母|国防|科技|科学|航天|太空|火箭|人工智能|机器学习|量子'
-            financial_re = r'股票|股价|基金|A股|港股|美股|纳斯达克|道指|标普|恒生|上证|深证|黄金|白银|原油|比特币|以太坊|期货|外汇|利率|CPI|GDP|通胀'
+            realtime_re = r'天气|股价|股票|汇率|新闻|最新|今天|现在|实时|比分|赛程|比赛|世界杯|欧冠|NBA|足球|篮球|网球|F1|奥运|金牌|金牌榜|高考|中考|真题|试题|作文|分数线|录取|成绩|体育|中超|英超|西甲|意甲|亚运|冠军|电竞|汽车|车型|新能源|电动车|特斯拉|续航|电器|家电|电视|冰箱|洗衣机|空调|电脑|编程|代码|开发|芯片|半导体|软件|军事|军队|武器|导弹|航母|国防|科技|科学|航天|太空|火箭|人工智能|机器学习|量子|微博热搜|知乎热榜|b站|bilibili|地震|ip地址|节假日|热搜|热榜'
+            financial_re = r'股票|股价|基金|A股|港股|美股|纳斯达克|道指|标普|恒生|上证|深证|黄金|白银|原油|比特币|以太坊|期货|外汇|利率|CPI|GDP|通胀|SOL|BNB|狗狗币|DOGE|代币|市值|coingecko'
 
             if re.search(lottery_re, query): intent = 'lottery'
             elif re.search(realtime_re, query): intent = 'realtime'
@@ -3338,6 +4284,26 @@ Current Date: {_now.strftime('%Y-%m-%d')}
 
     # ============ End DB handlers ============
 
+    def _handle_entities_extract(self):
+        """Extract entities from a conversation turn (fire-and-forget background thread)."""
+        try:
+            body = self._read_body()
+            user_msg = body.get("userMsg", "")
+            assistant_msg = body.get("assistantMsg", "")
+            api_key = self.headers.get("X-API-Key", "")
+            self._send_json({"ok": True, "queued": True})  # respond immediately
+
+            def _bg():
+                entities = extract_entities(user_msg, assistant_msg, api_key)
+                for e in entities:
+                    try:
+                        db.upsert_entity(e.get("type", "fact"), e.get("value", ""), e.get("context", ""))
+                    except Exception:
+                        pass
+            threading.Thread(target=_bg, daemon=True).start()
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+
     def _send_json(self, data, status=200):
         """Helper to send JSON response with restricted CORS.
         Silently ignores connection errors (client disconnected)."""
@@ -3421,6 +4387,16 @@ def main():
     print(f"  [CSRF] token injected: {LOCAL_TOKEN[:8]}...")
     # Pre-cache vendor assets for offline use
     _ensure_vendor_assets()
+    # Check if local SearXNG is running
+    try:
+        req = urllib.request.Request(_SEARXNG_URL + "/search?q=test&format=json", headers={"User-Agent": _UA, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            _ = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        print(f"  [SearXNG] local instance running at {_SEARXNG_URL} ✓")
+        _engine_success("SearXNG")
+    except Exception:
+        print(f"  [SearXNG] not running (optional) — install: setup_searxng.bat")
+        _engine_fail("SearXNG")
 
 
     # Use ThreadingMixIn so long requests don't block Ctrl+C
@@ -3451,7 +4427,7 @@ def main():
   局域网:   http://{lan_ip}:{PORT}
   手机扫码: {_qr_api}
   API代理:  /api/deepseek -> DeepSeek API
-  多引擎搜索: /api/search -> Sogou + Bing + DDG
+  多引擎搜索: /api/search -> Sogou + Bing + DDG + SearXNG(本地)
   数据存储: /api/db/*     -> SQLite
   按 Ctrl+C 停止服务器
 ============================================
